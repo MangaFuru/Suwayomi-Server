@@ -8,6 +8,7 @@ package suwayomi.tachidesk.manga.impl
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import eu.kanade.tachiyomi.source.model.MangasPage
+import eu.kanade.tachiyomi.source.online.HttpSource
 import org.jetbrains.exposed.dao.id.EntityID
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.batchInsert
@@ -23,6 +24,19 @@ import java.time.Instant
 object MangaList {
     fun proxyThumbnailUrl(mangaId: Int): String {
         return "/api/v1/manga/$mangaId/thumbnail"
+    }
+
+    private fun slimMode(): Boolean =
+        System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
+
+    // GoManga app-direct covers: the source's request headers (UA / Referer / …) so the
+    // app can fetch catalog covers straight from the CDN. slim-only — the source-handle
+    // lookup is pointless for the stock desktop server, which keeps the proxy thumbnailUrl.
+    private fun goMangaCoverHeaders(sourceId: Long): Map<String, String> {
+        if (!slimMode()) return emptyMap()
+        val source = getCatalogueSourceOrStub(sourceId) as? HttpSource ?: return emptyMap()
+        val headers = source.headers
+        return headers.names().associateWith { headers.get(it).orEmpty() }
     }
 
     suspend fun getMangaList(
@@ -120,10 +134,14 @@ object MangaList {
 
     fun MangasPage.processEntries(sourceId: Long): PagedMangaListDataClass {
         val mangasPage = this
+        // Computed OUTSIDE the transaction (jar-cached source-handle lookup, not DB I/O).
+        // slim-only; stock desktop keeps the empty map + proxy thumbnailUrl.
+        val coverHeaders = goMangaCoverHeaders(sourceId)
         val mangaList =
             transaction {
                 val mangaIds = insertOrUpdate(sourceId)
-                return@transaction MangaTable.select { MangaTable.id inList mangaIds }.map { MangaTable.toDataClass(it) }
+                return@transaction MangaTable.select { MangaTable.id inList mangaIds }
+                    .map { MangaTable.toDataClass(it, coverHeaders) }
             }
         return PagedMangaListDataClass(
             mangaList,

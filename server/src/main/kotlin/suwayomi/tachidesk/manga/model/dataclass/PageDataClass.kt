@@ -11,3 +11,12 @@ data class PageDataClass(
     val index: Int,
     var imageUrl: String,
 )
+
+data class PageImageResourceDataClass(
+    val index: Int,
+    val imageUrl: String?,
+    val headers: Map<String, String> = emptyMap(),
+    val cacheKey: String,
+    val fallbackImageUrl: String,
+    val requiresProxy: Boolean = false,
+)

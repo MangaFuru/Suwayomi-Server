@@ -1,0 +1,105 @@
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
+index 5b8961df..af02ddcf 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
+@@ -8,6 +8,7 @@ package suwayomi.tachidesk.manga.impl
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ import eu.kanade.tachiyomi.source.model.MangasPage
++import eu.kanade.tachiyomi.source.online.HttpSource
+ import org.jetbrains.exposed.dao.id.EntityID
+ import org.jetbrains.exposed.sql.and
+ import org.jetbrains.exposed.sql.batchInsert
+@@ -25,6 +26,19 @@ object MangaList {
+         return "/api/v1/manga/$mangaId/thumbnail"
+     }
+ 
++    private fun slimMode(): Boolean =
++        System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++
++    // GoManga app-direct covers: the source's request headers (UA / Referer / …) so the
++    // app can fetch catalog covers straight from the CDN. slim-only — the source-handle
++    // lookup is pointless for the stock desktop server, which keeps the proxy thumbnailUrl.
++    private fun goMangaCoverHeaders(sourceId: Long): Map<String, String> {
++        if (!slimMode()) return emptyMap()
++        val source = getCatalogueSourceOrStub(sourceId) as? HttpSource ?: return emptyMap()
++        val headers = source.headers
++        return headers.names().associateWith { headers.get(it).orEmpty() }
++    }
++
+     suspend fun getMangaList(
+         sourceId: Long,
+         pageNum: Int = 1,
+@@ -120,10 +134,14 @@ object MangaList {
+ 
+     fun MangasPage.processEntries(sourceId: Long): PagedMangaListDataClass {
+         val mangasPage = this
++        // Computed OUTSIDE the transaction (jar-cached source-handle lookup, not DB I/O).
++        // slim-only; stock desktop keeps the empty map + proxy thumbnailUrl.
++        val coverHeaders = goMangaCoverHeaders(sourceId)
+         val mangaList =
+             transaction {
+                 val mangaIds = insertOrUpdate(sourceId)
+-                return@transaction MangaTable.select { MangaTable.id inList mangaIds }.map { MangaTable.toDataClass(it) }
++                return@transaction MangaTable.select { MangaTable.id inList mangaIds }
++                    .map { MangaTable.toDataClass(it, coverHeaders) }
+             }
+         return PagedMangaListDataClass(
+             mangaList,
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
+index e5af42d7..a588b6e5 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
+@@ -44,6 +44,21 @@ data class MangaDataClass(
+     val chaptersAge: Long? = if (chaptersLastFetchedAt == null) null else Instant.now().epochSecond.minus(chaptersLastFetchedAt),
+     val trackers: List<MangaTrackerDataClass>? = null,
+ ) {
++    // GoManga app-direct covers: source-direct ABSOLUTE cover URL + the source's
++    // request headers, so the catalog grid fetches covers straight from the CDN
++    // (single hop) instead of the embedded-server /thumbnail proxy (the double hop
++    // that saturates the server OkHttp dispatcher and starves chapter/detail calls).
++    // stock thumbnailUrl stays the proxy URL = the app-direct FALLBACK.
++    //
++    // BODY properties (not constructor params) so this stays BINARY-COMPATIBLE for the
++    // class-swap build: the primary constructor, copy(), and componentN() signatures
++    // are unchanged, so existing compiled callers (CategoryManga / DownloadManager /
++    // Manga / GraphQL) keep linking against the un-recompiled jar. Set post-construction
++    // by MangaTable.toDataClass; serialized by Javalin/Jackson via the generated getter
++    // (plain data class — no @Serializable plugin needed for the recompile).
++    var coverThumbnailUrl: String? = null
++    var coverHeaders: Map<String, String> = emptyMap()
++
+     override fun toString(): String {
+         return "\"$title\" (id= $id) (sourceId= $sourceId)"
+     }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
+index 9f747228..74d98e03 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
+@@ -46,7 +46,10 @@ object MangaTable : IntIdTable() {
+     val updateStrategy = varchar("update_strategy", 256).default(UpdateStrategy.ALWAYS_UPDATE.name)
+ }
+ 
+-fun MangaTable.toDataClass(mangaEntry: ResultRow) =
++fun MangaTable.toDataClass(
++    mangaEntry: ResultRow,
++    coverRequestHeaders: Map<String, String> = emptyMap(),
++) =
+     MangaDataClass(
+         id = mangaEntry[this.id].value,
+         sourceId = mangaEntry[sourceReference].toString(),
+@@ -67,7 +70,13 @@ fun MangaTable.toDataClass(mangaEntry: ResultRow) =
+         lastFetchedAt = mangaEntry[lastFetchedAt],
+         chaptersLastFetchedAt = mangaEntry[chaptersLastFetchedAt],
+         updateStrategy = UpdateStrategy.valueOf(mangaEntry[updateStrategy]),
+-    )
++    ).apply {
++        // GoManga app-direct covers: source-direct absolute URL (stock thumbnailUrl
++        // stays the /thumbnail proxy = fallback) + the source's request headers.
++        // Set as BODY props (not ctor args) so MangaDataClass stays binary-compatible.
++        coverThumbnailUrl = mangaEntry[thumbnail_url]
++        coverHeaders = coverRequestHeaders
++    }
+ 
+ enum class MangaStatus(val value: Int) {
+     UNKNOWN(0),

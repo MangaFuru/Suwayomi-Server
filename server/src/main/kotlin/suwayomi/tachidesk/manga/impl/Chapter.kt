@@ -70,14 +70,26 @@ object Chapter {
         return if (onlineFetch) {
             getSourceChapters(mangaId)
         } else {
-            transaction {
-                ChapterTable.select { ChapterTable.manga eq mangaId }
-                    .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
-                    .map {
-                        ChapterTable.toDataClass(it)
-                    }
-            }.ifEmpty {
+            val chapterRows =
+                transaction {
+                    ChapterTable.select { ChapterTable.manga eq mangaId }
+                        .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
+                        .toList()
+                }
+
+            if (chapterRows.isEmpty()) {
                 getSourceChapters(mangaId)
+            } else {
+                val chapterIds = chapterRows.map { it[ChapterTable.id] }
+                val chapterMetas = getChaptersMetaMaps(chapterIds)
+                val chapterCount = chapterRows.size
+                chapterRows.map {
+                    ChapterTable.toDataClass(
+                        it,
+                        chapterCount = chapterCount,
+                        meta = chapterMetas[it[ChapterTable.id]].orEmpty(),
+                    )
+                }
             }
         }
     }
@@ -165,11 +177,24 @@ object Chapter {
                 // to a higher value than newer chapters
                 var maxSeenUploadDate = 0L
 
-                val chaptersInDb =
+                val chapterRowsInDb =
                     transaction {
                         ChapterTable.select { ChapterTable.manga eq mangaId }
-                            .map { ChapterTable.toDataClass(it) }
                             .toList()
+                    }
+                val chapterMetasInDb =
+                    if (chapterRowsInDb.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        getChaptersMetaMaps(chapterRowsInDb.map { it[ChapterTable.id] })
+                    }
+                val chaptersInDb =
+                    chapterRowsInDb.map {
+                        ChapterTable.toDataClass(
+                            it,
+                            chapterCount = chapterRowsInDb.size,
+                            meta = chapterMetasInDb[it[ChapterTable.id]].orEmpty(),
+                        )
                     }
 
                 // new chapters after they have been added to the database for auto downloads
@@ -271,7 +296,15 @@ object Chapter {
                                     this[ChapterTable.fetchedAt] = it
                                 }
                             }
-                        }.forEach { insertedChapters.add(ChapterTable.toDataClass(it)) }
+                        }.forEach {
+                            insertedChapters.add(
+                                ChapterTable.toDataClass(
+                                    it,
+                                    chapterCount = chapterList.size,
+                                    meta = emptyMap(),
+                                ),
+                            )
+                        }
                     }
 
                     if (chaptersToUpdate.isNotEmpty()) {

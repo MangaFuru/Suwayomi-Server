@@ -1,0 +1,64 @@
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+@@ -1056,6 +1056,12 @@
+                     .build()
+             }
+         networkHelper.cookieStore.addAll(httpUrl, cookies)
++        // GoMangaStableDefaultUA: the clearance UA deliberately does NOT touch
++        // the server-wide default UA. Per-host clearance/UA pairing lives in the
++        // host-side FlareSolverr shim, and the CloudflareInterceptor forces that
++        // UA onto each CF-walled request. Adopting it globally degraded
++        // UA-sensitive source APIs (happymh page-list under a mobile Safari UA).
++        // req.userAgent stays on the wire format for compatibility.
+     }
+ 
+     /** Proactively seed the server OkHttp jar with a verified host's cookies. */
+@@ -1069,6 +1075,36 @@
+                     return@Handler
+                 }
+             seedHostCookies(req)
++            ctx.status(200)
++        }
++
++    // GoMangaServerUserAgent: plain data class (Javalin Jackson, no @Serializable
++    // → no serialization-plugin recompile trap).
++    data class GoMangaDefaultUaRequest(
++        val userAgent: String = "",
++    )
++
++    /**
++     * Set the server's default HTTP-client User-Agent for source requests.
++     * The host calls this ONCE at boot with a STABLE ecosystem UA (the
++     * Tachiyomi/Mihon-family default the extensions are tested against), NOT
++     * the device WebKit UA — UA-sensitive source APIs degrade under a mobile
++     * Safari UA (happymh page-list). Cloudflare clearance/UA pairing is
++     * per-request via the CloudflareInterceptor + FlareSolverr shim instead.
++     * Idempotent via NetworkHelper's guard.
++     */
++    val gomangaDefaultUa =
++        io.javalin.http.Handler { ctx ->
++            val req =
++                try {
++                    ctx.bodyAsClass(GoMangaDefaultUaRequest::class.java)
++                } catch (_: Exception) {
++                    ctx.status(400)
++                    return@Handler
++                }
++            if (req.userAgent.isNotBlank()) {
++                networkHelper.setDefaultUserAgent(req.userAgent)
++            }
+             ctx.status(200)
+         }
+ }
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+@@ -191,6 +191,9 @@
+         path("gomanga") {
+             // host-owned-cookie-routing 4.1: proactive host->server cookie seed.
+             post("cf-cookies", MangaController.cfCookieSeed)
++            // GoMangaStableDefaultUA: set the server's stable ecosystem source
++            // UA at boot (clearance/UA pairing is per-request, never global).
++            post("default-ua", MangaController.gomangaDefaultUa)
+         }
+     }
+ }

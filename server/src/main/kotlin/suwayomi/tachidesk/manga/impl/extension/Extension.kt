@@ -84,6 +84,7 @@ object Extension {
             logger.debug { "Saving apk at $apkName" }
             // download apk file
             val downloadedFile = File(savePath)
+            downloadedFile.parentFile?.mkdirs()
             downloadedFile.sink().buffer().use { sink ->
                 inputStream.source().use { source ->
                     sink.writeAll(source)

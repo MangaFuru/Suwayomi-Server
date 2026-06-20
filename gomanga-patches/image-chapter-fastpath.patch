@@ -1,0 +1,656 @@
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+index b9f1f59..dbfa582 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+@@ -8,7 +8,14 @@ package suwayomi.tachidesk.manga.controller
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+ import io.javalin.http.HttpCode
++import io.javalin.http.Context
++import io.javalin.http.NotFoundResponse
+ import kotlinx.serialization.json.Json
++import org.jetbrains.exposed.sql.ResultRow
++import org.jetbrains.exposed.sql.SortOrder
++import org.jetbrains.exposed.sql.and
++import org.jetbrains.exposed.sql.select
++import org.jetbrains.exposed.sql.transactions.transaction
+ import org.kodein.di.DI
+ import org.kodein.di.conf.global
+ import org.kodein.di.instance
+@@ -16,21 +23,244 @@ import suwayomi.tachidesk.manga.impl.CategoryManga
+ import suwayomi.tachidesk.manga.impl.Chapter
+ import suwayomi.tachidesk.manga.impl.Library
+ import suwayomi.tachidesk.manga.impl.Manga
++import suwayomi.tachidesk.manga.impl.MangaList
+ import suwayomi.tachidesk.manga.impl.Page
+ import suwayomi.tachidesk.manga.impl.chapter.getChapterDownloadReadyByIndex
+ import suwayomi.tachidesk.manga.model.dataclass.CategoryDataClass
+ import suwayomi.tachidesk.manga.model.dataclass.ChapterDataClass
+ import suwayomi.tachidesk.manga.model.dataclass.MangaDataClass
++import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
++import suwayomi.tachidesk.manga.model.table.ChapterTable
++import suwayomi.tachidesk.manga.model.table.MangaStatus
++import suwayomi.tachidesk.manga.model.table.MangaTable
+ import suwayomi.tachidesk.server.JavalinSetup.future
+ import suwayomi.tachidesk.server.util.formParam
+ import suwayomi.tachidesk.server.util.handler
+ import suwayomi.tachidesk.server.util.pathParam
+ import suwayomi.tachidesk.server.util.queryParam
+ import suwayomi.tachidesk.server.util.withOperation
++import java.io.InputStream
++import java.util.concurrent.ConcurrentHashMap
+ import kotlin.time.Duration.Companion.days
+
+ object MangaController {
+     private val json by DI.global.instance<Json>()
++    private val goMangaChapterCache = ConcurrentHashMap<Int, Map<Int, GoMangaChapterDataClass>>()
++
++    data class GoMangaMangaDataClass(
++        val id: Int,
++        val sourceId: String,
++        val url: String,
++        val title: String,
++        val thumbnailUrl: String?,
++        val artist: String?,
++        val author: String?,
++        val description: String?,
++        val genre: List<String>,
++        val status: String,
++        val inLibrary: Boolean,
++        val realUrl: String?,
++        val lastFetchedAt: Long?,
++        val chaptersLastFetchedAt: Long?,
++        val chapterCount: Long?,
++    )
++
++    data class GoMangaChapterDataClass(
++        val id: Int,
++        val url: String,
++        val name: String,
++        val uploadDate: Long,
++        val chapterNumber: Float,
++        val scanlator: String?,
++        val mangaId: Int,
++        val read: Boolean,
++        val bookmarked: Boolean,
++        val lastPageRead: Int,
++        val lastReadAt: Long,
++        val index: Int,
++        val fetchedAt: Long,
++        val realUrl: String?,
++        val downloaded: Boolean,
++        val pageCount: Int,
++        val chapterCount: Int?,
++    )
++
++    private fun slimMode(): Boolean = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++
++    private fun String?.toGoMangaGenreList(): List<String> =
++        this
++            ?.split(",")
++            ?.map { it.trim() }
++            ?.filter { it.isNotEmpty() }
++            .orEmpty()
++
++    private suspend fun getGoMangaManga(
++        mangaId: Int,
++        onlineFetch: Boolean,
++    ): GoMangaMangaDataClass {
++        val initialized =
++            transaction {
++                MangaTable.select { MangaTable.id eq mangaId }
++                    .first()[MangaTable.initialized]
++            }
++        if (onlineFetch || !initialized) {
++            Manga.getManga(mangaId, onlineFetch)
++        }
++        return transaction {
++            val row = MangaTable.select { MangaTable.id eq mangaId }.first()
++            val chapterCount = ChapterTable.select { ChapterTable.manga eq mangaId }.count()
++            GoMangaMangaDataClass(
++                id = mangaId,
++                sourceId = row[MangaTable.sourceReference].toString(),
++                url = row[MangaTable.url],
++                title = row[MangaTable.title],
++                thumbnailUrl = MangaList.proxyThumbnailUrl(mangaId),
++                artist = row[MangaTable.artist],
++                author = row[MangaTable.author],
++                description = row[MangaTable.description],
++                genre = row[MangaTable.genre].toGoMangaGenreList(),
++                status = MangaStatus.valueOf(row[MangaTable.status]).name,
++                inLibrary = row[MangaTable.inLibrary],
++                realUrl = row[MangaTable.realUrl],
++                lastFetchedAt = row[MangaTable.lastFetchedAt],
++                chaptersLastFetchedAt = row[MangaTable.chaptersLastFetchedAt],
++                chapterCount = chapterCount,
++            )
++        }
++    }
++
++    private fun ResultRow.toGoMangaChapter(chapterCount: Int?): GoMangaChapterDataClass =
++        GoMangaChapterDataClass(
++            id = this[ChapterTable.id].value,
++            url = this[ChapterTable.url],
++            name = this[ChapterTable.name],
++            uploadDate = this[ChapterTable.date_upload],
++            chapterNumber = this[ChapterTable.chapter_number],
++            scanlator = this[ChapterTable.scanlator],
++            mangaId = this[ChapterTable.manga].value,
++            read = this[ChapterTable.isRead],
++            bookmarked = this[ChapterTable.isBookmarked],
++            lastPageRead = this[ChapterTable.lastPageRead],
++            lastReadAt = this[ChapterTable.lastReadAt],
++            index = this[ChapterTable.sourceOrder],
++            fetchedAt = this[ChapterTable.fetchedAt],
++            realUrl = this[ChapterTable.realUrl],
++            downloaded = this[ChapterTable.isDownloaded],
++            pageCount = this[ChapterTable.pageCount],
++            chapterCount = chapterCount,
++        )
++
++    private fun ChapterDataClass.toGoMangaChapter(): GoMangaChapterDataClass =
++        GoMangaChapterDataClass(
++            id = id,
++            url = url,
++            name = name,
++            uploadDate = uploadDate,
++            chapterNumber = chapterNumber,
++            scanlator = scanlator,
++            mangaId = mangaId,
++            read = read,
++            bookmarked = bookmarked,
++            lastPageRead = lastPageRead,
++            lastReadAt = lastReadAt,
++            index = index,
++            fetchedAt = fetchedAt,
++            realUrl = realUrl,
++            downloaded = downloaded,
++            pageCount = pageCount,
++            chapterCount = chapterCount,
++        )
++
++    private fun storeGoMangaChapterList(
++        mangaId: Int,
++        chapters: List<GoMangaChapterDataClass>,
++    ): List<GoMangaChapterDataClass> {
++        goMangaChapterCache[mangaId] = chapters.associateBy { it.index }
++        return chapters
++    }
++
++    private fun storeGoMangaChapter(
++        mangaId: Int,
++        chapter: GoMangaChapterDataClass,
++    ): GoMangaChapterDataClass {
++        val cached = goMangaChapterCache[mangaId].orEmpty().toMutableMap()
++        val existing = cached[chapter.index]
++        cached[chapter.index] =
++            if (existing != null && existing.pageCount > 0 && chapter.pageCount <= 0) {
++                existing
++            } else {
++                chapter
++            }
++        goMangaChapterCache[mangaId] = cached
++        return cached.getValue(chapter.index)
++    }
++
++    private suspend fun getGoMangaChapterList(
++        mangaId: Int,
++        onlineFetch: Boolean,
++    ): List<GoMangaChapterDataClass> {
++        if (onlineFetch) {
++            return storeGoMangaChapterList(
++                mangaId,
++                Chapter.getChapterList(mangaId, onlineFetch = true)
++                    .map { it.toGoMangaChapter() },
++            )
++        }
++
++        val cached =
++            transaction {
++                val rows =
++                    ChapterTable.select { ChapterTable.manga eq mangaId }
++                        .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
++                        .toList()
++                val chapterCount = rows.size
++                rows.map { it.toGoMangaChapter(chapterCount) }
++            }
++        if (cached.isNotEmpty()) {
++            return storeGoMangaChapterList(mangaId, cached)
++        }
++        return storeGoMangaChapterList(
++            mangaId,
++            Chapter.getChapterList(mangaId, onlineFetch = false)
++                .map { it.toGoMangaChapter() },
++        )
++    }
++
++    private fun getCachedGoMangaChapter(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): GoMangaChapterDataClass? {
++        goMangaChapterCache[mangaId]?.get(chapterIndex)?.let { return it }
++
++        val cached =
++            transaction {
++                ChapterTable.select {
++                    (ChapterTable.manga eq mangaId) and (ChapterTable.sourceOrder eq chapterIndex)
++                }
++                    .firstOrNull()
++                    ?.toGoMangaChapter(chapterCount = null)
++            }
++        return cached?.let { storeGoMangaChapter(mangaId, it) }
++    }
++
++    private suspend fun getOnlineGoMangaChapter(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): GoMangaChapterDataClass =
++        storeGoMangaChapter(
++            mangaId,
++            getChapterDownloadReadyByIndex(chapterIndex, mangaId).toGoMangaChapter(),
++        )
++
++    private fun imageBytes(
++        ctx: Context,
++        image: Pair<InputStream, String>,
++    ): ByteArray {
++        ctx.header("content-type", image.second)
++        val httpCacheSeconds = 1.days.inWholeSeconds
++        ctx.header("cache-control", "max-age=$httpCacheSeconds")
++        return image.first.use { it.readBytes() }
++    }
+
+     val retrieve =
+         handler(
+@@ -43,11 +273,15 @@ object MangaController {
+                 }
+             },
+             behaviorOf = { ctx, mangaId, onlineFetch ->
+-                ctx.future(
+-                    future {
+-                        Manga.getManga(mangaId, onlineFetch)
+-                    },
+-                )
++                if (slimMode()) {
++                    ctx.future(future { getGoMangaManga(mangaId, onlineFetch) })
++                } else {
++                    ctx.future(
++                        future {
++                            Manga.getManga(mangaId, onlineFetch)
++                        },
++                    )
++                }
+             },
+             withResults = {
+                 json<MangaDataClass>(HttpCode.OK)
+@@ -93,10 +327,7 @@ object MangaController {
+                 ctx.future(
+                     future { Manga.getMangaThumbnail(mangaId) }
+                         .thenApply {
+-                            ctx.header("content-type", it.second)
+-                            val httpCacheSeconds = 1.days.inWholeSeconds
+-                            ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-                            it.first
++                            imageBytes(ctx, it)
+                         },
+                 )
+             },
+@@ -244,7 +475,11 @@ object MangaController {
+                 }
+             },
+             behaviorOf = { ctx, mangaId, onlineFetch ->
+-                ctx.future(future { Chapter.getChapterList(mangaId, onlineFetch) })
++                if (slimMode()) {
++                    ctx.future(future { getGoMangaChapterList(mangaId, onlineFetch) })
++                } else {
++                    ctx.future(future { Chapter.getChapterList(mangaId, onlineFetch) })
++                }
+             },
+             withResults = {
+                 json<Array<ChapterDataClass>>(HttpCode.OK)
+@@ -302,14 +537,28 @@ object MangaController {
+         handler(
+             pathParam<Int>("mangaId"),
+             pathParam<Int>("chapterIndex"),
++            queryParam("onlineFetch", false),
+             documentWith = {
+                 withOperation {
+                     summary("Get a chapter")
+                     description("Get the chapter from the manga id and chapter index. It will also retrieve the pages for this chapter.")
+                 }
+             },
+-            behaviorOf = { ctx, mangaId, chapterIndex ->
+-                ctx.future(future { getChapterDownloadReadyByIndex(chapterIndex, mangaId) })
++            behaviorOf = { ctx, mangaId, chapterIndex, onlineFetch ->
++                if (slimMode()) {
++                    ctx.future(
++                        future {
++                            if (onlineFetch) {
++                                getOnlineGoMangaChapter(mangaId, chapterIndex)
++                            } else {
++                                val cached = getCachedGoMangaChapter(mangaId, chapterIndex)
++                                cached ?: throw NotFoundResponse("cached chapter not found")
++                            }
++                        },
++                    )
++                } else {
++                    ctx.future(future { getChapterDownloadReadyByIndex(chapterIndex, mangaId) })
++                }
+             },
+             withResults = {
+                 json<ChapterDataClass>(HttpCode.OK)
+@@ -388,6 +637,28 @@ object MangaController {
+             },
+         )
+
++    /** get direct-first page image resources for a chapter */
++    val pageResourceList =
++        handler(
++            pathParam<Int>("mangaId"),
++            pathParam<Int>("chapterIndex"),
++            documentWith = {
++                withOperation {
++                    summary("Get chapter page image resources")
++                    description(
++                        "Get direct-first page image URLs, request headers, cache keys, and fallback proxy URLs for host-side image loading.",
++                    )
++                }
++            },
++            behaviorOf = { ctx, mangaId, chapterIndex ->
++                ctx.future(future { Page.getPageImageResources(mangaId, chapterIndex) })
++            },
++            withResults = {
++                json<List<PageImageResourceDataClass>>(HttpCode.OK)
++                httpCode(HttpCode.NOT_FOUND)
++            },
++        )
++
+     /** get page at index "index" */
+     val pageRetrieve =
+         handler(
+@@ -406,10 +677,7 @@ object MangaController {
+                 ctx.future(
+                     future { Page.getPageImage(mangaId, chapterIndex, index) }
+                         .thenApply {
+-                            ctx.header("content-type", it.second)
+-                            val httpCacheSeconds = 1.days.inWholeSeconds
+-                            ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-                            it.first
++                            imageBytes(ctx, it)
+                         },
+                 )
+             },
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Chapter.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Chapter.kt
+index 2e89606..f15d5d9 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Chapter.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Chapter.kt
+@@ -70,14 +70,26 @@ object Chapter {
+         return if (onlineFetch) {
+             getSourceChapters(mangaId)
+         } else {
+-            transaction {
+-                ChapterTable.select { ChapterTable.manga eq mangaId }
+-                    .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
+-                    .map {
+-                        ChapterTable.toDataClass(it)
+-                    }
+-            }.ifEmpty {
++            val chapterRows =
++                transaction {
++                    ChapterTable.select { ChapterTable.manga eq mangaId }
++                        .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
++                        .toList()
++                }
++
++            if (chapterRows.isEmpty()) {
+                 getSourceChapters(mangaId)
++            } else {
++                val chapterIds = chapterRows.map { it[ChapterTable.id] }
++                val chapterMetas = getChaptersMetaMaps(chapterIds)
++                val chapterCount = chapterRows.size
++                chapterRows.map {
++                    ChapterTable.toDataClass(
++                        it,
++                        chapterCount = chapterCount,
++                        meta = chapterMetas[it[ChapterTable.id]].orEmpty(),
++                    )
++                }
+             }
+         }
+     }
+@@ -165,12 +177,25 @@ object Chapter {
+                 // to a higher value than newer chapters
+                 var maxSeenUploadDate = 0L
+
+-                val chaptersInDb =
++                val chapterRowsInDb =
+                     transaction {
+                         ChapterTable.select { ChapterTable.manga eq mangaId }
+-                            .map { ChapterTable.toDataClass(it) }
+                             .toList()
+                     }
++                val chapterMetasInDb =
++                    if (chapterRowsInDb.isEmpty()) {
++                        emptyMap()
++                    } else {
++                        getChaptersMetaMaps(chapterRowsInDb.map { it[ChapterTable.id] })
++                    }
++                val chaptersInDb =
++                    chapterRowsInDb.map {
++                        ChapterTable.toDataClass(
++                            it,
++                            chapterCount = chapterRowsInDb.size,
++                            meta = chapterMetasInDb[it[ChapterTable.id]].orEmpty(),
++                        )
++                    }
+
+                 // new chapters after they have been added to the database for auto downloads
+                 val insertedChapters = mutableListOf<ChapterDataClass>()
+@@ -271,7 +296,15 @@ object Chapter {
+                                     this[ChapterTable.fetchedAt] = it
+                                 }
+                             }
+-                        }.forEach { insertedChapters.add(ChapterTable.toDataClass(it)) }
++                        }.forEach {
++                            insertedChapters.add(
++                                ChapterTable.toDataClass(
++                                    it,
++                                    chapterCount = chapterList.size,
++                                    meta = emptyMap(),
++                                ),
++                            )
++                        }
+                     }
+
+                     if (chaptersToUpdate.isNotEmpty()) {
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
+index 26d47e4..2ed484f 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
+@@ -11,13 +11,17 @@ import eu.kanade.tachiyomi.source.local.LocalSource
+ import eu.kanade.tachiyomi.source.model.Page
+ import eu.kanade.tachiyomi.source.online.HttpSource
+ import kotlinx.coroutines.flow.StateFlow
++import okhttp3.Headers
++import org.jetbrains.exposed.sql.ResultRow
+ import org.jetbrains.exposed.sql.SortOrder
+ import org.jetbrains.exposed.sql.and
+ import org.jetbrains.exposed.sql.select
+ import org.jetbrains.exposed.sql.transactions.transaction
+ import org.jetbrains.exposed.sql.update
++import suwayomi.tachidesk.manga.impl.chapter.getChapterDownloadReadyByIndex
+ import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
+ import suwayomi.tachidesk.manga.impl.util.source.GetCatalogueSource.getCatalogueSourceOrStub
++import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
+ import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
+ import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
+ import suwayomi.tachidesk.manga.model.table.ChapterTable
+@@ -27,6 +31,58 @@ import java.io.File
+ import java.io.InputStream
+
+ object Page {
++    private fun pageProxyPath(
++        mangaId: Int,
++        chapterIndex: Int,
++        index: Int,
++    ): String = "/api/v1/manga/$mangaId/chapter/$chapterIndex/page/$index"
++
++    private fun pageCacheKey(
++        mangaId: Int,
++        chapterIndex: Int,
++        index: Int,
++        imageUrl: String?,
++        pageUrl: String,
++    ): String = "suwayomi-page:$mangaId:$chapterIndex:$index:${imageUrl ?: pageUrl}"
++
++    private fun Headers.toHeaderMap(): Map<String, String> =
++        names().associateWith { name -> get(name).orEmpty() }
++
++    private fun pageRowsForChapter(chapterId: Int): List<ResultRow> =
++        transaction {
++            PageTable.select { PageTable.chapter eq chapterId }
++                .orderBy(PageTable.index to SortOrder.ASC)
++                .toList()
++        }
++
++    private suspend fun resolveHttpImageUrl(
++        pageEntry: ResultRow,
++        chapterId: Int,
++        source: HttpSource,
++    ): String? {
++        val cached = pageEntry[PageTable.imageUrl]
++        if (cached != null) return cached
++
++        val tachiyomiPage =
++            Page(
++                pageEntry[PageTable.index],
++                pageEntry[PageTable.url],
++                null,
++            )
++        val trueImageUrl =
++            try {
++                getTrueImageUrl(tachiyomiPage, source)
++            } catch (_: Exception) {
++                return null
++            }
++        transaction {
++            PageTable.update({ (PageTable.chapter eq chapterId) and (PageTable.index eq pageEntry[PageTable.index]) }) {
++                it[imageUrl] = trueImageUrl
++            }
++        }
++        return trueImageUrl
++    }
++
+     /**
+      * A page might have a imageUrl ready from the get go, or we might need to
+      * go an extra step and call fetchImageUrl to get it.
+@@ -41,6 +97,60 @@ object Page {
+         return page.imageUrl!!
+     }
+
++    suspend fun getPageImageResources(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): List<PageImageResourceDataClass> {
++        val mangaEntry = transaction { MangaTable.select { MangaTable.id eq mangaId }.first() }
++        val source = getCatalogueSourceOrStub(mangaEntry[MangaTable.sourceReference])
++        var chapterEntry =
++            transaction {
++                ChapterTable.select {
++                    (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId)
++                }.first()
++            }
++        val chapterId = chapterEntry[ChapterTable.id].value
++
++        var pageRows = pageRowsForChapter(chapterId)
++        if (pageRows.isEmpty() || chapterEntry[ChapterTable.pageCount] <= 0) {
++            getChapterDownloadReadyByIndex(chapterIndex, mangaId)
++            chapterEntry =
++                transaction {
++                    ChapterTable.select {
++                        (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId)
++                    }.first()
++                }
++            pageRows = pageRowsForChapter(chapterEntry[ChapterTable.id].value)
++        }
++
++        if (source !is HttpSource) {
++            return pageRows.map { pageEntry ->
++                val index = pageEntry[PageTable.index]
++                PageImageResourceDataClass(
++                    index = index,
++                    imageUrl = null,
++                    cacheKey = pageCacheKey(mangaId, chapterIndex, index, null, pageEntry[PageTable.url]),
++                    fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
++                    requiresProxy = true,
++                )
++            }
++        }
++
++        val headers = source.headers.toHeaderMap()
++        return pageRows.map { pageEntry ->
++            val index = pageEntry[PageTable.index]
++            val imageUrl = resolveHttpImageUrl(pageEntry, chapterEntry[ChapterTable.id].value, source)
++            PageImageResourceDataClass(
++                index = index,
++                imageUrl = imageUrl,
++                headers = headers,
++                cacheKey = pageCacheKey(mangaId, chapterIndex, index, imageUrl, pageEntry[PageTable.url]),
++                fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
++                requiresProxy = imageUrl == null,
++            )
++        }
++    }
++
+     suspend fun getPageImage(
+         mangaId: Int,
+         chapterIndex: Int,
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
+index 48cfbc6..42bbc36 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
+@@ -11,3 +11,12 @@ data class PageDataClass(
+     val index: Int,
+     var imageUrl: String,
+ )
++
++data class PageImageResourceDataClass(
++    val index: Int,
++    val imageUrl: String?,
++    val headers: Map<String, String> = emptyMap(),
++    val cacheKey: String,
++    val fallbackImageUrl: String,
++    val requiresProxy: Boolean = false,
++)
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/ChapterTable.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/ChapterTable.kt
+index f3abc52..b263285 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/ChapterTable.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/ChapterTable.kt
+@@ -41,7 +41,11 @@ object ChapterTable : IntIdTable() {
+     val manga = reference("manga", MangaTable, ReferenceOption.CASCADE)
+ }
+
+-fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
++fun ChapterTable.toDataClass(
++    chapterEntry: ResultRow,
++    chapterCount: Int,
++    meta: Map<String, String>,
++) =
+     ChapterDataClass(
+         id = chapterEntry[id].value,
+         url = chapterEntry[url],
+@@ -59,6 +63,13 @@ fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
+         realUrl = chapterEntry[realUrl],
+         downloaded = chapterEntry[isDownloaded],
+         pageCount = chapterEntry[pageCount],
+-        chapterCount = transaction { ChapterTable.select { manga eq chapterEntry[manga].value }.count().toInt() },
++        chapterCount = chapterCount,
++        meta = meta,
++    )
++
++fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
++    toDataClass(
++        chapterEntry,
++        chapterCount = transaction { select { manga eq chapterEntry[manga].value }.count().toInt() },
+         meta = getChapterMetaMap(chapterEntry[id]),
+     )

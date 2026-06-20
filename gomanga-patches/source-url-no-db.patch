@@ -1,0 +1,486 @@
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+index 689f3d30..c03f560e 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+@@ -170,6 +170,12 @@ object MangaAPI {
+             post("{sourceId}/filters", SourceController.setFilters)
+             get("{sourceId}/search", SourceController.searchSingle)
+             post("{sourceId}/quick-search", SourceController.quickSearchSingle)
++            // GoManga no-DB source-URL addressing (source-token-addressing):
++            // detail / chapter-list / page-list by the REAL source URL, no H2.
++            get("{sourceId}/manga/details", MangaController.mangaDetailByUrl)
++            get("{sourceId}/manga/chapters", MangaController.chapterListByUrl)
++            get("{sourceId}/manga/chapter/pages", MangaController.pageResourceListByUrl)
++            get("{sourceId}/manga/chapter/page-image", MangaController.pageImageByUrl)
+         }
+ 
+         path("manga") {
+@@ -181,5 +187,10 @@ object MangaAPI {
+             get("{mangaId}/chapter/{chapterIndex}/pages", MangaController.pageResourceList)
+             get("{mangaId}/chapter/{chapterIndex}/page/{index}", MangaController.pageRetrieve)
+         }
++
++        path("gomanga") {
++            // host-owned-cookie-routing 4.1: proactive host->server cookie seed.
++            post("cf-cookies", MangaController.cfCookieSeed)
++        }
+     }
+ }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+index dbfa582b..0ac0a777 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+@@ -33,6 +33,17 @@ import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
+ import suwayomi.tachidesk.manga.model.table.ChapterTable
+ import suwayomi.tachidesk.manga.model.table.MangaStatus
+ import suwayomi.tachidesk.manga.model.table.MangaTable
++import eu.kanade.tachiyomi.network.NetworkHelper
++import eu.kanade.tachiyomi.source.model.SManga
++import eu.kanade.tachiyomi.source.model.SChapter
++import eu.kanade.tachiyomi.source.model.Page as SourcePage
++import eu.kanade.tachiyomi.source.online.HttpSource
++import eu.kanade.tachiyomi.util.chapter.ChapterRecognition
++import eu.kanade.tachiyomi.util.chapter.ChapterSanitizer.sanitize
++import okhttp3.Cookie
++import okhttp3.HttpUrl
++import suwayomi.tachidesk.manga.impl.util.source.GetCatalogueSource.getCatalogueSourceOrStub
++import uy.kohesive.injekt.injectLazy
+ import suwayomi.tachidesk.server.JavalinSetup.future
+ import suwayomi.tachidesk.server.util.formParam
+ import suwayomi.tachidesk.server.util.handler
+@@ -47,6 +58,20 @@ object MangaController {
+     private val json by DI.global.instance<Json>()
+     private val goMangaChapterCache = ConcurrentHashMap<Int, Map<Int, GoMangaChapterDataClass>>()
+ 
++    // In-memory LRU cover cache keyed by DB mangaId. The slim iOS embedded server
++    // CANNOT disk-cache covers: getImageResponse's write to tempThumbnailCacheRoot
++    // 500s on the sandboxed iOS filesystem (v0.5.24 regression). So spare the catalog
++    // grid a per-cell CDN re-fetch with a bounded in-memory cache instead. Covers are
++    // small (~30-50 KB); 256 entries ~= 8-13 MB, evicted least-recently-used.
++    private val goMangaCoverCache: MutableMap<Int, Pair<ByteArray, String>> =
++        java.util.Collections.synchronizedMap(
++            object : LinkedHashMap<Int, Pair<ByteArray, String>>(64, 0.75f, true) {
++                override fun removeEldestEntry(
++                    eldest: MutableMap.MutableEntry<Int, Pair<ByteArray, String>>,
++                ): Boolean = size > 256
++            },
++        )
++
+     data class GoMangaMangaDataClass(
+         val id: Int,
+         val sourceId: String,
+@@ -255,11 +280,21 @@ object MangaController {
+     private fun imageBytes(
+         ctx: Context,
+         image: Pair<InputStream, String>,
+-    ): ByteArray {
++    ): InputStream {
+         ctx.header("content-type", image.second)
+         val httpCacheSeconds = 1.days.inWholeSeconds
+         ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-        return image.first.use { it.readBytes() }
++        // GoMangaStreamedImageProxy (embedded-jvm-runtime-tuning 3.1): hand the
++        // source InputStream to Javalin, which copies it to the response in a
++        // bounded (~4-8KB) buffer and closes it — instead of `readBytes()`
++        // materializing the WHOLE image in JVM heap per proxied request, the
++        // dominant transient-heap source on the pure-interpreter device VM under
++        // a cover/page load burst. The stream is valid at this point (the prior
++        // `readBytes()` consumed it here), so Javalin's slightly-later streamed
++        // read is safe; validated by the demo image tests (no truncation / no
++        // "Stream closed"). Do NOT wrap in `.use {}` — Javalin owns closing it
++        // after the response is written.
++        return image.first
+     }
+ 
+     val retrieve =
+@@ -314,6 +349,41 @@ object MangaController {
+         )
+ 
+     /** manga thumbnail */
++    // GoManga slim cover proxy: fetch the DB manga's cover via the source's OWN
++    // OkHttp client (per-source auth: baozi AppBypass referer/CDN rewrite, manhuaren
++    // gsn signing), materialize the bytes in-memory, and serve subsequent grid cells
++    // from a bounded LRU cache. source.getImage returns 200 where the stock
++    // fetchHttpSourceMangaThumbnail's FORCE_NETWORK + refresh path 500s for baozi. We
++    // must NOT disk-cache via getImageResponse — its write to tempThumbnailCacheRoot
++    // 500s on the sandboxed iOS FS (v0.5.24 regression) — so the LRU map IS the cache
++    // (a warm hit is a heap read, not a CDN round-trip). AntiWatermarkInterceptor — the
++    // only libawt risk — is disabled on iOS by the host app's pref seeding.
++    private suspend fun getGoMangaThumbnail(mangaId: Int): Pair<InputStream, String> {
++        goMangaCoverCache[mangaId]?.let { (bytes, contentType) ->
++            return java.io.ByteArrayInputStream(bytes) to contentType
++        }
++        val (sourceId, coverUrl) =
++            transaction {
++                val row = MangaTable.select { MangaTable.id eq mangaId }.first()
++                row[MangaTable.sourceReference] to row[MangaTable.thumbnail_url]
++            }
++        val cover =
++            coverUrl?.takeIf { it.isNotBlank() }
++                ?: throw NotFoundResponse("manga $mangaId has no thumbnail url")
++        val source =
++            getCatalogueSourceOrStub(sourceId) as? HttpSource
++                ?: throw NotFoundResponse("source $sourceId is not an HttpSource")
++        // Materialize bytes WHILE the OkHttp Response is open: Javalin streams the
++        // result AFTER the future resolves, by when a lazy byteStream() is already
++        // closed (cf. getGoMangaPageImageByUrl's "closed" IOException). Per-request
++        // heap stays bounded by the 32/8 OkHttp dispatcher cap.
++        val response = source.getImage(SourcePage(index = 0, url = "", imageUrl = cover))
++        val contentType = response.header("content-type") ?: "image/jpeg"
++        val bytes = response.use { it.body?.bytes() } ?: throw NotFoundResponse("empty cover body")
++        goMangaCoverCache[mangaId] = bytes to contentType
++        return java.io.ByteArrayInputStream(bytes) to contentType
++    }
++
+     val thumbnail =
+         handler(
+             pathParam<Int>("mangaId"),
+@@ -325,7 +395,10 @@ object MangaController {
+             },
+             behaviorOf = { ctx, mangaId ->
+                 ctx.future(
+-                    future { Manga.getMangaThumbnail(mangaId) }
++                    future {
++                        // Slim (embedded iOS): source-client fetch + disk cache.
++                        if (slimMode()) getGoMangaThumbnail(mangaId) else Manga.getMangaThumbnail(mangaId)
++                    }
+                         .thenApply {
+                             imageBytes(ctx, it)
+                         },
+@@ -686,4 +759,336 @@ object MangaController {
+                 httpCode(HttpCode.NOT_FOUND)
+             },
+         )
++
++    // ──────────────────────────────────────────────────────────────────────
++    // GoManga no-DB source-URL addressing (source-token-addressing)
++    //
++    // Address detail / chapter-list / page-list by the REAL source URL via the
++    // extension SPI, performing NO MangaTable/ChapterTable/PageTable read or
++    // write — removing the H2 round-trip + write churn (MangaList.processEntries
++    // write-N-rows, Chapter delete+batchInsert) that degrades the
++    // pure-interpreter device JVM over a browsing session. The legacy DB-id
++    // routes above stay registered (additive). Source handles come from
++    // GetCatalogueSource (jar-cached by id; needs no manga DB row).
++    // ──────────────────────────────────────────────────────────────────────
++
++    /** Tachiyomi pages for a (sourceId, chapterURL), cached so the URL-keyed
++     *  proxy fallback does not re-run getPageList per page. */
++    private val goMangaUrlPageCache = ConcurrentHashMap<String, List<SourcePage>>()
++
++    private fun urlPageCacheKey(
++        sourceId: Long,
++        chapterUrl: String,
++    ): String = "$sourceId:$chapterUrl"
++
++    private fun urlPageProxyPath(
++        sourceId: Long,
++        chapterUrl: String,
++        index: Int,
++    ): String =
++        "/api/v1/source/$sourceId/manga/chapter/page-image?chapterUrl=" +
++            java.net.URLEncoder.encode(chapterUrl, "UTF-8") + "&index=$index"
++
++    private fun okhttp3.Headers.goMangaHeaderMap(): Map<String, String> = names().associateWith { get(it).orEmpty() }
++
++    private suspend fun goMangaTrueImageUrl(
++        page: SourcePage,
++        source: HttpSource,
++    ): String {
++        if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
++        return page.imageUrl!!
++    }
++
++    private suspend fun getGoMangaMangaByUrl(
++        sourceId: Long,
++        mangaUrl: String,
++    ): GoMangaMangaDataClass {
++        val source = getCatalogueSourceOrStub(sourceId)
++        val sManga = SManga.create().apply { url = mangaUrl; title = mangaUrl }
++        val details = source.getMangaDetails(sManga)
++        return GoMangaMangaDataClass(
++            id = 0,
++            sourceId = sourceId.toString(),
++            url = mangaUrl,
++            title = details.title,
++            // Source-direct thumbnail URL (NOT proxyThumbnailUrl(mangaId): there
++            // is no DB id here, and the app loads covers app-direct anyway).
++            thumbnailUrl = details.thumbnail_url,
++            artist = details.artist,
++            author = details.author,
++            description = details.description,
++            genre = details.genre.toGoMangaGenreList(),
++            status = MangaStatus.valueOf(details.status).name,
++            inLibrary = false,
++            // realUrl = the source's own browsable page (mirror-aware), mirroring the
++            // DB path (Manga.kt:153 → getMangaUrl). baozi (fork) overrides getMangaUrl
++            // to honor its v1.key.api_option mirror (e.g. tw.baozimh.com); happymh
++            // yields a real /manga page. The old baseUrl+url IGNORED those overrides,
++            // so "open website" + CF WebView verification used www.baozimh.com no
++            // matter which mirror the user picked.
++            realUrl = (source as? HttpSource)?.getMangaUrl(sManga),
++            lastFetchedAt = null,
++            chaptersLastFetchedAt = null,
++            chapterCount = null,
++        )
++    }
++
++    private suspend fun getGoMangaChaptersByUrl(
++        sourceId: Long,
++        mangaUrl: String,
++        mangaTitle: String,
++    ): List<GoMangaChapterDataClass> {
++        val source = getCatalogueSourceOrStub(sourceId)
++        val sManga =
++            SManga.create().apply {
++                url = mangaUrl
++                title = mangaTitle
++            }
++        val chapters = source.getChapterList(sManga)
++        // Enrich identically to the DB path (Chapter.fetchChapterList) so chapter
++        // numbers / names match the legacy route — but write NO ChapterTable rows.
++        chapters.forEach { chapter ->
++            (source as? HttpSource)?.prepareNewChapter(chapter, sManga)
++            chapter.chapter_number =
++                ChapterRecognition
++                    .parseChapterNumber(mangaTitle, chapter.name, chapter.chapter_number.toDouble())
++                    .toFloat()
++            chapter.name = chapter.name.sanitize(mangaTitle)
++            chapter.scanlator = chapter.scanlator?.ifBlank { null }?.trim()
++        }
++        val count = chapters.size
++        // index mirrors ChapterTable.sourceOrder: sources return newest-first, so
++        // the newest chapter gets the highest index (the app sorts by index desc).
++        return chapters.mapIndexed { position, chapter ->
++            GoMangaChapterDataClass(
++                id = 0,
++                url = chapter.url,
++                name = chapter.name,
++                uploadDate = chapter.date_upload,
++                chapterNumber = chapter.chapter_number,
++                scanlator = chapter.scanlator,
++                mangaId = 0,
++                read = false,
++                bookmarked = false,
++                lastPageRead = 0,
++                lastReadAt = 0,
++                index = count - position,
++                fetchedAt = 0,
++                realUrl = null,
++                downloaded = false,
++                pageCount = 0,
++                chapterCount = count,
++            )
++        }
++    }
++
++    private suspend fun getGoMangaPagesByUrl(
++        sourceId: Long,
++        chapterUrl: String,
++    ): List<PageImageResourceDataClass> {
++        val source = getCatalogueSourceOrStub(sourceId)
++        val pages = source.getPageList(SChapter.create().apply { url = chapterUrl })
++        goMangaUrlPageCache[urlPageCacheKey(sourceId, chapterUrl)] = pages
++        if (source !is HttpSource) {
++            return pages.map { page ->
++                PageImageResourceDataClass(
++                    index = page.index,
++                    imageUrl = null,
++                    cacheKey = "${urlPageCacheKey(sourceId, chapterUrl)}:${page.index}:${page.url}",
++                    fallbackImageUrl = urlPageProxyPath(sourceId, chapterUrl, page.index),
++                    requiresProxy = true,
++                )
++            }
++        }
++        val headers = source.headers.goMangaHeaderMap()
++        return pages.map { page ->
++            val imageUrl =
++                try {
++                    goMangaTrueImageUrl(page, source)
++                } catch (_: Exception) {
++                    null
++                }
++            PageImageResourceDataClass(
++                index = page.index,
++                imageUrl = imageUrl,
++                headers = headers,
++                cacheKey = "${urlPageCacheKey(sourceId, chapterUrl)}:${page.index}:${imageUrl ?: page.url}",
++                fallbackImageUrl = urlPageProxyPath(sourceId, chapterUrl, page.index),
++                requiresProxy = imageUrl == null,
++            )
++        }
++    }
++
++    private suspend fun getGoMangaPageImageByUrl(
++        sourceId: Long,
++        chapterUrl: String,
++        index: Int,
++    ): Pair<InputStream, String> {
++        val source = getCatalogueSourceOrStub(sourceId)
++        val key = urlPageCacheKey(sourceId, chapterUrl)
++        val pages =
++            goMangaUrlPageCache[key]
++                ?: source.getPageList(SChapter.create().apply { url = chapterUrl })
++                    .also { goMangaUrlPageCache[key] = it }
++        val page =
++            pages.firstOrNull { it.index == index }
++                ?: pages.getOrNull(index)
++                ?: throw NotFoundResponse("page $index not found for $chapterUrl")
++        // LocalSource (and any non-HTTP source) serves page bytes from disk, not
++        // OkHttp. Materialize eagerly (like the HttpSource path below) so the bytes
++        // are still valid when Javalin streams the future's result — a lazy
++        // FileInputStream is already closed by then (IOException: Stream Closed).
++        // Archive chapters expose entries via LocalSource.pageCache (keyed by the
++        // no-DB chapterUrl); directory chapters carry an absolute file path in
++        // page.imageUrl.
++        if (source !is HttpSource) {
++            val cached = eu.kanade.tachiyomi.source.local.LocalSource.pageCache[chapterUrl]?.getOrNull(index)
++            val bytes: ByteArray =
++                if (cached != null) {
++                    cached().use { it.readBytes() }
++                } else {
++                    val filePath = page.imageUrl
++                        ?: throw NotFoundResponse("page $index has no local source for $chapterUrl")
++                    java.io.File(filePath).inputStream().use { it.readBytes() }
++                }
++            val contentType =
++                suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
++                    .findImageType { java.io.ByteArrayInputStream(bytes) }?.mime ?: "image/jpeg"
++            return java.io.ByteArrayInputStream(bytes) to contentType
++        }
++        if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
++        val response = source.getImage(page)
++        val contentType = response.header("content-type") ?: "image/jpeg"
++        // Materialize the bytes WHILE the OkHttp Response is open. The slim route
++        // returns this via `ctx.future{…}.thenApply{imageBytes}` and Javalin streams
++        // the result AFTER the future resolves — by then `response` is out of scope
++        // and OkHttp has closed its body, so returning the lazy `byteStream()` threw
++        // `java.io.IOException: closed` (the manhuaren reader 500). Reading into a
++        // ByteArrayInputStream here keeps it valid; per-request heap stays bounded by
++        // the 32/8 OkHttp dispatcher cap (embedded-jvm-runtime-tuning 1.1).
++        val bytes = response.use { it.body?.bytes() } ?: throw NotFoundResponse("empty image body")
++        return java.io.ByteArrayInputStream(bytes) to contentType
++    }
++
++    // Plain Javalin handlers (NOT the `handler(...)` util): that util wraps every
++    // route in Javalin's OpenAPI `documented(...)` handler, whose request-time
++    // lambda throws NullPointerException for these routes in the slim embedded
++    // server — which surfaces as a 404. The no-DB routes therefore register as
++    // plain handlers; the JSON response is still produced by `ctx.future`
++    // rendering the future's object result, exactly as the util's behaviorOf does
++    // (cf. the slim `retrieve` handler).
++
++    /** detail by real source URL (no DB) */
++    val mangaDetailByUrl =
++        io.javalin.http.Handler { ctx ->
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future(future { getGoMangaMangaByUrl(ctx.pathParam("sourceId").toLong(), url) })
++            }
++        }
++
++    /** chapter list by real source URL (no DB) */
++    val chapterListByUrl =
++        io.javalin.http.Handler { ctx ->
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future(
++                    future {
++                        getGoMangaChaptersByUrl(
++                            ctx.pathParam("sourceId").toLong(),
++                            url,
++                            ctx.queryParam("title").orEmpty(),
++                        )
++                    },
++                )
++            }
++        }
++
++    /** page resource list by real chapter URL (no DB) */
++    val pageResourceListByUrl =
++        io.javalin.http.Handler { ctx ->
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future(future { getGoMangaPagesByUrl(ctx.pathParam("sourceId").toLong(), url) })
++            }
++        }
++
++    /** URL-keyed page-image proxy (last-resort fallback for the no-DB path) */
++    val pageImageByUrl =
++        io.javalin.http.Handler { ctx ->
++            val chapterUrl = ctx.queryParam("chapterUrl").orEmpty()
++            if (chapterUrl.isBlank()) {
++                ctx.status(400)
++            } else {
++                val index = ctx.queryParam("index")?.toIntOrNull() ?: 0
++                ctx.future(
++                    future { getGoMangaPageImageByUrl(ctx.pathParam("sourceId").toLong(), chapterUrl, index) }
++                        .thenApply { imageBytes(ctx, it) },
++                )
++            }
++        }
++
++    // ──────────────────────────────────────────────────────────────────────
++    // host-owned-cookie-routing 4.1: proactive server cookie seed
++    //
++    // The host pushes a verified host's FULL cookie set (not cf_clearance only)
++    // into the server's OkHttp jar PROACTIVELY (on boot / after verification),
++    // so the first source-parsing request to a Cloudflare host already carries
++    // the clearance instead of taking a 403 -> FlareSolverr /v1 round-trip. The
++    // reactive /v1 pull (CloudflareInterceptor) stays as the fallback. Plain
++    // data classes (Javalin's mapper) — no @Serializable, so the class-swap
++    // recompile needs no serialization plugin.
++    // ──────────────────────────────────────────────────────────────────────
++
++    private val networkHelper: NetworkHelper by injectLazy()
++
++    data class GoMangaSeedCookie(
++        val name: String,
++        val value: String,
++        val domain: String,
++        val path: String = "/",
++    )
++
++    data class GoMangaCookieSeedRequest(
++        val host: String,
++        val cookies: List<GoMangaSeedCookie>,
++        val userAgent: String = "",
++    )
++
++    private fun seedHostCookies(req: GoMangaCookieSeedRequest) {
++        val host = req.host.removePrefix(".")
++        if (host.isBlank() || req.cookies.isEmpty()) return
++        val httpUrl = HttpUrl.Builder().scheme("https").host(host).build()
++        val cookies =
++            req.cookies.map { c ->
++                Cookie
++                    .Builder()
++                    .name(c.name)
++                    .value(c.value)
++                    .domain(c.domain.removePrefix("."))
++                    .path(c.path.ifBlank { "/" })
++                    .build()
++            }
++        networkHelper.cookieStore.addAll(httpUrl, cookies)
++    }
++
++    /** Proactively seed the server OkHttp jar with a verified host's cookies. */
++    val cfCookieSeed =
++        io.javalin.http.Handler { ctx ->
++            val req =
++                try {
++                    ctx.bodyAsClass(GoMangaCookieSeedRequest::class.java)
++                } catch (_: Exception) {
++                    ctx.status(400)
++                    return@Handler
++                }
++            seedHostCookies(req)
++            ctx.status(200)
++        }
+ }

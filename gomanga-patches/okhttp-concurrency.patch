@@ -1,0 +1,97 @@
+--- a/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -47,16 +47,35 @@
+     }
+     // Tachidesk <--
+ 
+-    private val userAgent =
+-        MutableStateFlow(
+-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+-        )
++    // GoMangaStableDefaultUA: the stock Suwayomi default is a DESKTOP Chrome UA.
++    // The host pushes a STABLE ecosystem UA (the Tachiyomi/Mihon-family default
++    // the extensions are tested against) over it at boot via setDefaultUserAgent.
++    // Deliberately NOT the device WebKit UA: UA-sensitive source APIs degrade
++    // under a mobile Safari UA (happymh page-list), and Cloudflare clearance/UA
++    // pairing is per CF-walled request (CloudflareInterceptor), never global.
++    private val userAgent = MutableStateFlow(DEFAULT_USER_AGENT)
+ 
+     fun defaultUserAgentProvider(): String {
+         return userAgent.value
+     }
+ 
++    // GoMangaStableDefaultUA: let the host push ONE canonical source UA at boot
++    // (POST /api/v1/gomanga/default-ua). This is the only writer of the global
++    // default — the CloudflareInterceptor's global adoption is disabled (see the
++    // interceptor wiring below) and the cookie-seed route no longer adopts the
++    // clearance UA, so a CF verify can never flip every source onto a mobile UA.
++    //
++    // Blank + equality guarded: a UA change fires the drop(1) watcher below
++    // (unregisterAllCatalogueSources, rebuilding every cached source). Re-pushing
++    // the same UA (every boot/relaunch seeds it) must be a no-op or it churns
++    // live source instances for nothing. Set once at boot on a cold cache; the
++    // guard makes repeats free.
++    fun setDefaultUserAgent(ua: String) {
++        if (ua.isNotBlank() && ua != userAgent.value) {
++            userAgent.value = ua
++        }
++    }
++
+     init {
+         @OptIn(DelicateCoroutinesApi::class)
+         userAgent
+@@ -71,6 +90,22 @@
+         get() {
+             val builder =
+                 OkHttpClient.Builder()
++                    // GoMangaOkHttpConcurrency: bound concurrent source requests
++                    // through the embedded JVM proxy. OkHttp's default is 64/5; a
++                    // prior pass raised this to 128/16 to fill cover grids faster,
++                    // but on the pure-interpreter DEVICE VM that let too many
++                    // full-image heap buffers run at once, degrading the whole JVM
++                    // over a session (local listSources 50ms->4.5s on iPhone 14
++                    // Pro 2026-06-04; reproduced x1.8 on a forced-interpreter sim).
++                    // Cap at 32/8 — aligned with the app's cover request limiter
++                    // (8) so real parallelism is preserved while heap/GC pressure
++                    // is bounded.
++                    .dispatcher(
++                        okhttp3.Dispatcher().apply {
++                            maxRequests = 32
++                            maxRequestsPerHost = 8
++                        },
++                    )
+                     .cookieJar(PersistentCookieJar(cookieStore))
+                     .connectTimeout(30, TimeUnit.SECONDS)
+                     .readTimeout(30, TimeUnit.SECONDS)
+@@ -102,8 +137,15 @@
+             builder.addNetworkInterceptor(httpLoggingInterceptor)
+             // }
+ 
++            // GoMangaStableDefaultUA: a CF solve must NOT adopt the clearance UA
++            // as the server-wide default. The clearance UA is the host device's
++            // WebKit UA, and UA-sensitive source APIs degrade under it for every
++            // unrelated request (happymh page-list). The CloudflareInterceptor
++            // already forces the clearance UA + cookies onto each CF-walled
++            // request itself; the global default stays whatever the host pushed
++            // via /api/v1/gomanga/default-ua.
+             builder.addInterceptor(
+-                CloudflareInterceptor(setUserAgent = { userAgent.value = it }),
++                CloudflareInterceptor(setUserAgent = { _ -> }),
+             )
+ 
+             // when (preferences.dohProvider().get()) {
+@@ -128,4 +170,13 @@
+     val client by lazy { baseClientBuilder.build() }
+ 
+     val cloudflareClient by lazy { client }
++
++    companion object {
++        // GoMangaStableDefaultUA: the stock desktop-Chrome default, used until
++        // the host pushes the ecosystem UA at boot. Still a content-safe UA for
++        // UA-sensitive sources if that push never arrives.
++        const val DEFAULT_USER_AGENT =
++            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
++                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++    }
+ }

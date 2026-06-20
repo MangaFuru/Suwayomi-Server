@@ -1,0 +1,12 @@
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
+index 0b804e5..2eba56e 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
+@@ -84,6 +84,7 @@ object Extension {
+             logger.debug { "Saving apk at $apkName" }
+             // download apk file
+             val downloadedFile = File(savePath)
++            downloadedFile.parentFile?.mkdirs()
+             downloadedFile.sink().buffer().use { sink ->
+                 inputStream.source().use { source ->
+                     sink.writeAll(source)

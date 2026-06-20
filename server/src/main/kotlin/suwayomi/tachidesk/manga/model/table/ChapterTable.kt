@@ -41,7 +41,11 @@ object ChapterTable : IntIdTable() {
     val manga = reference("manga", MangaTable, ReferenceOption.CASCADE)
 }
 
-fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
+fun ChapterTable.toDataClass(
+    chapterEntry: ResultRow,
+    chapterCount: Int,
+    meta: Map<String, String>,
+) =
     ChapterDataClass(
         id = chapterEntry[id].value,
         url = chapterEntry[url],
@@ -59,6 +63,13 @@ fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
         realUrl = chapterEntry[realUrl],
         downloaded = chapterEntry[isDownloaded],
         pageCount = chapterEntry[pageCount],
-        chapterCount = transaction { ChapterTable.select { manga eq chapterEntry[manga].value }.count().toInt() },
+        chapterCount = chapterCount,
+        meta = meta,
+    )
+
+fun ChapterTable.toDataClass(chapterEntry: ResultRow) =
+    toDataClass(
+        chapterEntry,
+        chapterCount = transaction { select { manga eq chapterEntry[manga].value }.count().toInt() },
         meta = getChapterMetaMap(chapterEntry[id]),
     )
