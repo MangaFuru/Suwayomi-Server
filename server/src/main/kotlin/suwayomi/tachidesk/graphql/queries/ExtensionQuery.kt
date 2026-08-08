@@ -14,6 +14,7 @@ import graphql.schema.DataFetchingEnvironment
 import org.jetbrains.exposed.v1.core.Column
 import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.less
 import org.jetbrains.exposed.v1.core.neq
@@ -43,6 +44,7 @@ import suwayomi.tachidesk.graphql.server.primitives.lessNotUnique
 import suwayomi.tachidesk.graphql.server.primitives.maybeSwap
 import suwayomi.tachidesk.graphql.types.ExtensionNodeList
 import suwayomi.tachidesk.graphql.types.ExtensionType
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import java.util.concurrent.CompletableFuture
@@ -215,7 +217,10 @@ class ExtensionQuery {
             transaction {
                 val res = ExtensionTable.selectAll()
 
-                res.adjustWhere { ExtensionTable.name neq LocalSource.EXTENSION_NAME }
+                res.adjustWhere {
+                    (ExtensionTable.name neq LocalSource.EXTENSION_NAME) and
+                        (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
+                }
 
                 res.applyOps(condition, filter)
 

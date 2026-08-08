@@ -20,6 +20,8 @@ import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -54,7 +56,14 @@ class CloudflareInterceptor(
 
         logger.debug { "Cloudflare anti-bot is on, CloudflareInterceptor is kicking in..." }
 
-        return try {
+        // GoMangaConvergeFirst: try the FlareSolverr/shim path FIRST. It adopts the
+        // cf_clearance cookies + the clearance UA into the server's OWN OkHttp jar
+        // (cookieStore.addAll + setUserAgent) and retries the request DIRECTLY — so
+        // once a host is solved, subsequent requests in the session go direct instead
+        // of paying the WebView-proxy double-hop on every call. The WebView proxy stays
+        // as the LAST resort below.
+        val originalCode = originalResponse.code
+        try {
             originalResponse.close()
             // network.cookieStore.remove(originalRequest.url.toUri())
 
@@ -92,12 +101,43 @@ class CloudflareInterceptor(
             val request =
                 CFClearance.requestWithFlareSolverr(flareResponse, setUserAgent, originalRequest)
 
-            chain.proceed(request)
+            val retried = chain.proceed(request)
+            // If the direct retry (now carrying the adopted cf_clearance + UA) is NO
+            // LONGER a Cloudflare wall, convergence worked — return it and the host
+            // stays on the cheap direct path for the rest of the session. BUT some
+            // sources (e.g. happymh) gate behind a browser-TLS / path-scoped challenge
+            // that the JVM OkHttp client canNOT pass even WITH a valid clearance cookie
+            // + UA — the direct retry stays 403/Cloudflare. In that case do NOT return
+            // the 403; fall through to the WebView proxy (Safari TLS + same-origin
+            // context), which is the ONLY path that clears those sources.
+            val stillWalled =
+                retried.code in ERROR_CODES && retried.header("Server") in SERVER_CHECK
+            if (!stillWalled) {
+                return retried
+            }
+            logger.debug { "Direct adoption still walled (code=${retried.code}); falling back to the WebView proxy" }
+            retried.close()
         } catch (e: Exception) {
-            // Because OkHttp's enqueue only handles IOExceptions, wrap the exception so that
-            // we don't crash the entire app
-            throw IOException(e)
+            // The shim has no clearance for this host yet, or the bypass failed
+            // (CloudflareBypassException / transport). Do NOT propagate — fall through
+            // to the WebView proxy, which can solve the challenge interactively and
+            // flag the host for user verification.
+            logger.debug(e) { "Direct adoption failed; falling back to the WebView proxy" }
         }
+
+        // WebView proxy fallback — the LAST resort. Reached when direct adoption failed
+        // or — crucially — succeeded at adopting cookies but the source STILL walls the
+        // JVM client (browser-TLS-gated sources like happymh). This is the only path
+        // those sources clear.
+        runBlocking {
+            CFClearance.resolveWithGoMangaProxy(originalRequest, originalCode)
+        }?.let { proxyResponse ->
+            return proxyResponse
+        }
+
+        // A Cloudflare wall that neither direct adoption nor the proxy could clear.
+        // OkHttp's enqueue only handles IOExceptions, so surface one (don't crash).
+        throw IOException("Cloudflare challenge could not be resolved")
     }
 
     companion object {
@@ -184,6 +224,72 @@ object CFClearance {
         val endTimestamp: Long,
         val version: String,
     )
+
+    @Serializable
+    data class GoMangaProxyRequest(
+        val method: String,
+        val url: String,
+        val headers: Map<String, String>,
+        val body: String? = null,
+    )
+
+    @Serializable
+    data class GoMangaProxyResponse(
+        val status: Int,
+        val headers: Map<String, String>,
+        val body: String,
+    )
+
+    suspend fun resolveWithGoMangaProxy(
+        originalRequest: Request,
+        responseCode: Int,
+    ): Response? {
+        if (!shouldAttemptGoMangaProxy(originalRequest, responseCode)) {
+            return null
+        }
+
+        val requestBody = originalRequest.textBodyOrNull()
+        if (originalRequest.body != null && requestBody == null) {
+            return null
+        }
+
+        val proxyUrl = serverConfig.flareSolverrUrl.value.removeSuffix("/") + "/gomanga-proxy"
+        val proxyResponse =
+            try {
+                with(json) {
+                    client.value
+                        .newCall(
+                            POST(
+                                url = proxyUrl,
+                                body =
+                                    Json
+                                        .encodeToString(
+                                            GoMangaProxyRequest(
+                                                method = originalRequest.method,
+                                                url = originalRequest.url.toString(),
+                                                headers = originalRequest.headers.asMap(),
+                                                body = requestBody,
+                                            ),
+                                        ).toRequestBody(jsonMediaType),
+                            ),
+                        ).awaitSuccess()
+                        .parseAs<GoMangaProxyResponse>()
+                }
+            } catch (e: Exception) {
+                logger.debug(e) { "GoManga WebView proxy fallback failed for ${originalRequest.url}" }
+                return null
+            }
+
+        if (proxyResponse.status !in 200..399) {
+            logger.debug {
+                "GoManga WebView proxy returned ${proxyResponse.status} for ${originalRequest.url}; keeping original response"
+            }
+            return null
+        }
+
+        logger.debug { "GoManga WebView proxy served ${originalRequest.method} ${originalRequest.url}" }
+        return proxyResponse.toOkHttpResponse(originalRequest)
+    }
 
     suspend fun resolveWithFlareSolver(
         originalRequest: Request,
@@ -291,6 +397,92 @@ object CFClearance {
             logger.debug { "Cloudflare challenge failed to resolve" }
             throw CloudflareBypassException()
         }
+    }
+
+    private fun shouldAttemptGoMangaProxy(
+        request: Request,
+        responseCode: Int,
+    ): Boolean {
+        if (!serverConfig.flareSolverrEnabled.value) {
+            return false
+        }
+
+        if (responseCode !in listOf(400, 403, 429, 503)) {
+            return false
+        }
+
+        if (request.method !in listOf("GET", "POST")) {
+            return false
+        }
+
+        val host = request.url.host.lowercase()
+        if (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+            return false
+        }
+
+        val accept = request.header("Accept")?.lowercase().orEmpty()
+        if (accept.contains("image/") || accept.contains("video/")) {
+            return false
+        }
+
+        val bodyType = request.body?.contentType()
+        if (bodyType != null && !bodyType.isTextLike()) {
+            return false
+        }
+
+        return true
+    }
+
+    private fun Request.textBodyOrNull(): String? {
+        val requestBody = body ?: return null
+        val type = requestBody.contentType()
+        if (type != null && !type.isTextLike()) {
+            return null
+        }
+
+        val buffer = Buffer()
+        requestBody.writeTo(buffer)
+        return buffer.readUtf8()
+    }
+
+    private fun okhttp3.MediaType.isTextLike(): Boolean {
+        val major = type.lowercase()
+        val subtype = subtype.lowercase()
+        return major == "text" ||
+            subtype.contains("json") ||
+            subtype.contains("xml") ||
+            subtype.contains("form")
+    }
+
+    private fun okhttp3.Headers.asMap(): Map<String, String> =
+        names().associateWith { name -> get(name).orEmpty() }
+
+    private fun GoMangaProxyResponse.toOkHttpResponse(originalRequest: Request): Response {
+        val contentType =
+            headers.entries
+                .firstOrNull { (name, _) -> name.equals("content-type", ignoreCase = true) }
+                ?.value
+                ?: "text/plain; charset=utf-8"
+        val responseBuilder =
+            Response
+                .Builder()
+                .request(originalRequest)
+                .protocol(Protocol.HTTP_1_1)
+                .code(status)
+                .message("GoManga WebView proxy")
+                .body(body.toResponseBody(contentType.toMediaTypeOrNull()))
+
+        headers.forEach { (name, value) ->
+            if (!name.equals("content-length", ignoreCase = true)) {
+                try {
+                    responseBuilder.header(name, value)
+                } catch (_: IllegalArgumentException) {
+                    logger.debug { "Skipping invalid proxied response header: $name" }
+                }
+            }
+        }
+
+        return responseBuilder.build()
     }
 
     private class CloudflareBypassException : Exception()

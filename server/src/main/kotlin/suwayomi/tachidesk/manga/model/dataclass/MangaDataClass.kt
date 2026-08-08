@@ -50,6 +50,21 @@ data class MangaDataClass(
     @JsonIgnore
     val memo: JsonObject = JsonObject.EMPTY,
 ) {
+    // GoManga app-direct covers: source-direct ABSOLUTE cover URL + the source's
+    // request headers, so the catalog grid fetches covers straight from the CDN
+    // (single hop) instead of the embedded-server /thumbnail proxy (the double hop
+    // that saturates the server OkHttp dispatcher and starves chapter/detail calls).
+    // stock thumbnailUrl stays the proxy URL = the app-direct FALLBACK.
+    //
+    // BODY properties (not constructor params) so this stays BINARY-COMPATIBLE for the
+    // class-swap build: the primary constructor, copy(), and componentN() signatures
+    // are unchanged, so existing compiled callers (CategoryManga / DownloadManager /
+    // Manga / GraphQL) keep linking against the un-recompiled jar. Set post-construction
+    // by MangaTable.toDataClass; serialized by Javalin/Jackson via the generated getter
+    // (plain data class — no @Serializable plugin needed for the recompile).
+    var coverThumbnailUrl: String? = null
+    var coverHeaders: Map<String, String> = emptyMap()
+
     override fun toString(): String = "\"$title\" (id= $id) (sourceId= $sourceId)"
 
     @Deprecated("Remove with V1 Api")

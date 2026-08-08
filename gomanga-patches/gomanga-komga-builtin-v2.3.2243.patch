@@ -1,0 +1,2538 @@
+# GoManga built-in Komga runtime patch for Suwayomi-Server v2.3.2243
+# Apply after patches/gomanga-slim-v2.3.2243.patch.
+# Provider provenance: keiyoushi/extensions-source revision 9f2565708438fbbcbe86d5c0f120571b0de0bbc7
+# Provider license: Apache-2.0
+
+diff --git a/server/build.gradle.kts b/server/build.gradle.kts
+index 77c03ce7f2673fe6726fc966c7ed666135d33290..e3fc001127874cfb8e49f564ee173a64c5cee4e5 100644
+--- a/server/build.gradle.kts
++++ b/server/build.gradle.kts
+@@ -67,6 +67,8 @@ dependencies {
+     implementation(libs.okhttp.core)
+     implementation(libs.rxjava)
+     implementation(libs.jsoup)
++    // GoManga built-in Komga provider: chapter-title templates.
++    implementation("org.apache.commons:commons-text:1.11.0")
+ 
+     // ComicInfo
+     implementation(libs.serialization.xml.core)
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/Komga.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/Komga.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff7337958c668d675d26ad2726aeacbdcba1aaba
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/Komga.kt
+@@ -0,0 +1,532 @@
++/*
++ * Adapted from keiyoushi/extensions-source at
++ * 9f2565708438fbbcbe86d5c0f120571b0de0bbc7.
++ *
++ * Copyright 2015 Javier Tomás and contributors
++ * Licensed under the Apache License, Version 2.0.
++ */
++package eu.kanade.tachiyomi.extension.all.komga
++
++import android.content.SharedPreferences
++import android.util.Log
++import androidx.preference.MultiSelectListPreference
++import androidx.preference.PreferenceScreen
++import eu.kanade.tachiyomi.AppInfo
++import eu.kanade.tachiyomi.extension.all.komga.dto.AuthorDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.BookDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.CollectionDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.LibraryDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.PageDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.PageWrapperDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.ReadListDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.SeriesDto
++import eu.kanade.tachiyomi.network.GET
++import eu.kanade.tachiyomi.network.await
++import eu.kanade.tachiyomi.source.ConfigurableSource
++import eu.kanade.tachiyomi.source.UnmeteredSource
++import eu.kanade.tachiyomi.source.model.Filter
++import eu.kanade.tachiyomi.source.model.FilterList
++import eu.kanade.tachiyomi.source.model.MangasPage
++import eu.kanade.tachiyomi.source.model.Page
++import eu.kanade.tachiyomi.source.model.SChapter
++import eu.kanade.tachiyomi.source.model.SManga
++import eu.kanade.tachiyomi.source.online.HttpSource
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.serialization.decodeFromString
++import kotlinx.serialization.json.Json
++import okhttp3.Credentials
++import okhttp3.Dns
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import org.apache.commons.text.StringSubstitutor
++import uy.kohesive.injekt.injectLazy
++import java.util.Locale
++
++class Komga(
++    override val lang: String,
++    override val id: Long,
++) : HttpSource(),
++    ConfigurableSource,
++    UnmeteredSource {
++
++    internal val preferences: SharedPreferences by lazy { getSourcePreferences() }
++
++    private val displayName by lazy { preferences.getString(PREF_DISPLAY_NAME, "")!! }
++
++    override val name by lazy {
++        val displayNameSuffix = displayName
++            .ifBlank { instanceSuffix }
++            .let { if (it.isNotBlank()) " ($it)" else "" }
++
++        "Komga$displayNameSuffix"
++    }
++
++    // Distinguish the fixed factory instances by position (Komga, Komga (2), Komga (3), ...)
++    // when the user hasn't set a display name. Inferred from the source id.
++    private val instanceSuffix: String
++        get() = BUILT_IN_KOMGA_INSTANCE_IDS.indexOf(id).let { if (it > 0) "${it + 1}" else "" }
++
++    override val baseUrl by lazy { preferences.getString(PREF_ADDRESS, "")!!.removeSuffix("/") }
++
++    override val supportsLatest = true
++
++    private val username by lazy { preferences.getString(PREF_USERNAME, "")!! }
++
++    private val password by lazy { preferences.getString(PREF_PASSWORD, "")!! }
++
++    private val apiKey by lazy { preferences.getString(PREF_API_KEY, "")!! }
++
++    private val defaultLibraries
++        get() = preferences.getStringSet(PREF_DEFAULT_LIBRARIES, emptySet())!!
++
++    private val json: Json by injectLazy()
++
++    override fun headersBuilder() = super.headersBuilder()
++        .set("User-Agent", "TachiyomiKomga/${AppInfo.getVersionName()}")
++        .also { builder ->
++            if (apiKey.isNotBlank()) {
++                builder.set("X-API-Key", apiKey)
++            }
++        }
++
++    override val client: OkHttpClient =
++        network.client.newBuilder()
++            .authenticator { _, response ->
++                if (apiKey.isNotBlank() || response.request.header("Authorization") != null) {
++                    null // Give up if API key is set or we've already failed to authenticate.
++                } else {
++                    response.request.newBuilder()
++                        .addHeader("Authorization", Credentials.basic(username, password))
++                        .build()
++                }
++            }
++            .dns(Dns.SYSTEM) // don't use DNS over HTTPS as it breaks IP addressing
++            .build()
++
++    override fun popularMangaRequest(page: Int): Request = searchMangaRequest(
++        page,
++        "",
++        FilterList(
++            SeriesSort(Filter.Sort.Selection(1, true)),
++        ),
++    )
++
++    override fun popularMangaParse(response: Response): MangasPage = processSeriesPage(response, baseUrl)
++
++    override fun latestUpdatesRequest(page: Int): Request = searchMangaRequest(
++        page,
++        "",
++        FilterList(
++            SeriesSort(Filter.Sort.Selection(3, false)),
++        ),
++    )
++
++    override fun latestUpdatesParse(response: Response): MangasPage = processSeriesPage(response, baseUrl)
++
++    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
++        val collectionId = (filters.find { it is CollectionSelect } as? CollectionSelect)?.let {
++            it.collections[it.state].id
++        }
++
++        val type = when {
++            collectionId != null -> "collections/$collectionId/series"
++            filters.find { it is TypeSelect }?.state == 1 -> "readlists"
++            filters.find { it is TypeSelect }?.state == 2 -> "books"
++            else -> "series"
++        }
++
++        val url = "$baseUrl/api/v1".toHttpUrl().newBuilder()
++            .addPathSegments(type)
++            .addQueryParameter("search", query)
++            .addQueryParameter("page", (page - 1).toString())
++            .addQueryParameter("deleted", "false")
++
++        val filterList = filters.ifEmpty { getFilterList() }
++        val defaultLibraries = defaultLibraries
++
++        if (filterList.filterIsInstance<LibraryFilter>().isEmpty() && defaultLibraries.isNotEmpty()) {
++            url.addQueryParameter("library_id", defaultLibraries.joinToString(","))
++        }
++
++        filterList.forEach { filter ->
++            when (filter) {
++                is UriFilter -> filter.addToUri(url)
++
++                is Filter.Sort -> {
++                    val state = filter.state ?: return@forEach
++
++                    val sortCriteria = when (state.index) {
++                        0 -> "relevance"
++                        1 -> if (type == "series") "metadata.titleSort" else "name"
++                        2 -> "createdDate"
++                        3 -> "lastModifiedDate"
++                        4 -> "random"
++                        else -> return@forEach
++                    } + "," + if (state.ascending) "asc" else "desc"
++
++                    url.addQueryParameter("sort", sortCriteria)
++                }
++
++                else -> {}
++            }
++        }
++
++        return GET(url.build(), headers)
++    }
++
++    override fun searchMangaParse(response: Response): MangasPage = processSeriesPage(response, baseUrl)
++
++    private fun processSeriesPage(response: Response, baseUrl: String): MangasPage {
++        val data = if (response.isFromReadList()) {
++            response.parseAs<PageWrapperDto<ReadListDto>>()
++        } else if (response.isFromBook()) {
++            response.parseAs<PageWrapperDto<BookDto>>()
++        } else {
++            response.parseAs<PageWrapperDto<SeriesDto>>()
++        }
++
++        return MangasPage(data.content.map { it.toSManga(baseUrl) }, !data.last)
++    }
++
++    override fun getMangaUrl(manga: SManga) = manga.url.replace("/api/v1", "")
++
++    override fun mangaDetailsRequest(manga: SManga) = GET(manga.url, headers)
++
++    override fun mangaDetailsParse(response: Response): SManga = if (response.isFromReadList()) {
++        response.parseAs<ReadListDto>().toSManga(baseUrl)
++    } else if (response.isFromBook()) {
++        response.parseAs<BookDto>().toSManga(baseUrl)
++    } else {
++        response.parseAs<SeriesDto>().toSManga(baseUrl)
++    }
++
++    private val chapterNameTemplate
++        get() = preferences.getString(PREF_CHAPTER_NAME_TEMPLATE, PREF_CHAPTER_NAME_TEMPLATE_DEFAULT)!!
++
++    override fun getChapterUrl(chapter: SChapter) = chapter.url.replace("/api/v1/books", "/book")
++
++    override fun chapterListRequest(manga: SManga): Request = when {
++        manga.url.isFromBook() -> GET("${manga.url}?unpaged=true&media_status=READY&deleted=false", headers)
++        else -> GET("${manga.url}/books?unpaged=true&media_status=READY&deleted=false", headers)
++    }
++
++    override fun chapterListParse(response: Response): List<SChapter> {
++        if (response.isFromBook()) {
++            val book = response.parseAs<BookDto>()
++            return listOf(
++                SChapter.create().apply {
++                    chapter_number = 1F
++                    url = "$baseUrl/api/v1/books/${book.id}"
++                    name = book.getChapterName(chapterNameTemplate, isFromReadList = true)
++                    scanlator = book.metadata.authors
++                        .filter { it.role == "translator" }
++                        .joinToString { it.name }
++                    date_upload = when {
++                        book.metadata.releaseDate != null -> parseDate(book.metadata.releaseDate)
++                        book.created != null -> parseDateTime(book.created)
++                        else -> parseDateTime(book.fileLastModified)
++                    }
++                },
++            )
++        }
++        val page = response.parseAs<PageWrapperDto<BookDto>>().content
++        val isFromReadList = response.isFromReadList()
++        val chapterNameTemplate = chapterNameTemplate
++
++        return page
++            .filter {
++                it.media.mediaProfile != "EPUB" || it.media.epubDivinaCompatible
++            }
++            .mapIndexed { index, book ->
++                SChapter.create().apply {
++                    chapter_number = if (!isFromReadList) book.metadata.numberSort else index + 1F
++                    url = "$baseUrl/api/v1/books/${book.id}"
++                    name = book.getChapterName(chapterNameTemplate, isFromReadList)
++                    scanlator = book.metadata.authors
++                        .filter { it.role == "translator" }
++                        .joinToString { it.name }
++                    date_upload = when {
++                        book.metadata.releaseDate != null -> parseDate(book.metadata.releaseDate)
++
++                        book.created != null -> parseDateTime(book.created)
++
++                        // XXX: `Book.fileLastModified` actually uses the server's running timezone,
++                        // not UTC, even if the timestamp ends with a Z! We cannot determine the
++                        // server's timezone, which is why this is a last resort option.
++                        else -> parseDateTime(book.fileLastModified)
++                    }
++                }
++            }
++            .sortedByDescending { it.chapter_number }
++    }
++
++    override fun pageListRequest(chapter: SChapter) = GET("${chapter.url}/pages", headers)
++
++    override fun pageListParse(response: Response): List<Page> {
++        val pages = response.parseAs<List<PageDto>>()
++
++        return pages.map {
++            val url = "${response.request.url}/${it.number}" +
++                if (!SUPPORTED_IMAGE_TYPES.contains(it.mediaType)) {
++                    "?convert=png"
++                } else {
++                    ""
++                }
++
++            Page(it.number, imageUrl = url)
++        }
++    }
++
++    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
++
++    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers = headersBuilder().add("Accept", "image/*,*/*;q=0.8").build())
++
++    override fun getFilterList(): FilterList {
++        fetchFilterOptions()
++
++        val filters = mutableListOf<Filter<*>>(
++            UnreadFilter(),
++            InProgressFilter(),
++            ReadFilter(),
++            TypeSelect(),
++            CollectionSelect(
++                buildList {
++                    add(CollectionFilterEntry("None"))
++                    collections.forEach {
++                        add(CollectionFilterEntry(it.name, it.id))
++                    }
++                },
++            ),
++            LibraryFilter(libraries, defaultLibraries),
++            UriMultiSelectFilter(
++                "Status",
++                "status",
++                listOf("Ongoing", "Ended", "Abandoned", "Hiatus").map {
++                    UriMultiSelectOption(it, it.uppercase(Locale.ROOT))
++                },
++            ),
++            UriMultiSelectFilter(
++                "Genres",
++                "genre",
++                genres.map { UriMultiSelectOption(it) },
++            ),
++            UriMultiSelectFilter(
++                "Tags",
++                "tag",
++                tags.map { UriMultiSelectOption(it) },
++            ),
++            UriMultiSelectFilter(
++                "Publishers",
++                "publisher",
++                publishers.map { UriMultiSelectOption(it) },
++            ),
++        ).apply {
++            if (fetchFilterStatus != FetchFilterStatus.FETCHED) {
++                val message = if (fetchFilterStatus == FetchFilterStatus.NOT_FETCHED && fetchFiltersAttempts >= 3) {
++                    "Failed to fetch filtering options from the server"
++                } else {
++                    "Press 'Reset' to show filtering options"
++                }
++
++                add(0, Filter.Header(message))
++                add(1, Filter.Separator())
++            }
++
++            addAll(authors.map { (role, authors) -> AuthorGroup(role, authors.map { AuthorFilter(it) }) })
++            add(SeriesSort())
++        }
++
++        return FilterList(filters)
++    }
++
++    override fun setupPreferenceScreen(screen: PreferenceScreen) {
++        fetchFilterOptions()
++
++        screen.addEditTextPreference(
++            title = "Source display name",
++            default = "",
++            summary = displayName.ifBlank { "Here you can change the source display name" },
++            key = PREF_DISPLAY_NAME,
++            restartRequired = true,
++        )
++        screen.addEditTextPreference(
++            title = "Address",
++            default = "",
++            summary = baseUrl.ifBlank { "The server address" },
++            dialogMessage = "The address must not end with a forward slash.",
++            validate = { it.toHttpUrlOrNull() != null && !it.endsWith("/") },
++            validationMessage = "The URL is invalid, malformed, or ends with a slash",
++            key = PREF_ADDRESS,
++            restartRequired = true,
++        )
++        // API key preference (takes precedence over username/password)
++        screen.addEditTextPreference(
++            title = "API key",
++            default = "",
++            summary = if (apiKey.isBlank()) "Optional: Use an API key for authentication" else "*".repeat(apiKey.length),
++            key = PREF_API_KEY,
++            restartRequired = true,
++        )
++        // Only show username/password if API key is not set
++        if (apiKey.isBlank()) {
++            screen.addEditTextPreference(
++                title = "Username",
++                default = "",
++                summary = username.ifBlank { "The user account email" },
++                key = PREF_USERNAME,
++                restartRequired = true,
++            )
++            screen.addEditTextPreference(
++                title = "Password",
++                default = "",
++                summary = if (password.isBlank()) "The user account password" else "*".repeat(password.length),
++                key = PREF_PASSWORD,
++                restartRequired = true,
++            )
++        }
++
++        MultiSelectListPreference(screen.context).apply {
++            key = PREF_DEFAULT_LIBRARIES
++            title = "Default libraries"
++            summary = buildString {
++                append("Show content from selected libraries by default.")
++
++                if (libraries.isEmpty()) {
++                    append(" Exit and enter the settings menu to load options.")
++                }
++            }
++            entries = libraries.map { it.name }.toTypedArray()
++            entryValues = libraries.map { it.id }.toTypedArray()
++            setDefaultValue(emptySet<String>())
++        }.also(screen::addPreference)
++
++        val values = hashMapOf(
++            "title" to "",
++            "seriesTitle" to "",
++            "number" to "",
++            "createdDate" to "",
++            "releaseDate" to "",
++            "size" to "",
++            "sizeBytes" to "",
++        )
++        val stringSubstitutor = StringSubstitutor(values, "{", "}").apply {
++            isEnableUndefinedVariableException = true
++        }
++
++        screen.addEditTextPreference(
++            key = PREF_CHAPTER_NAME_TEMPLATE,
++            title = "Chapter title format",
++            summary = "Customize how chapter names appear. Chapters in read lists will always be prefixed by the series' name.",
++            default = PREF_CHAPTER_NAME_TEMPLATE_DEFAULT,
++            dialogMessage = """
++            |Supported placeholders:
++            |- {title}: Chapter name
++            |- {seriesTitle}: Series name
++            |- {number}: Chapter number
++            |- {createdDate}: Chapter creation date
++            |- {releaseDate}: Chapter release date
++            |- {size}: Chapter file size (formatted)
++            |- {sizeBytes}: Chapter file size (in bytes)
++            |If you wish to place some text between curly brackets, place the escape character "$"
++            |before the opening curly bracket, e.g. ${'$'}{series}.
++            """.trimMargin(),
++            validate = {
++                try {
++                    stringSubstitutor.replace(it)
++                    true
++                } catch (e: IllegalArgumentException) {
++                    false
++                }
++            },
++            validationMessage = "Invalid chapter title format",
++        )
++    }
++
++    private var libraries = emptyList<LibraryDto>()
++    private var collections = emptyList<CollectionDto>()
++    private var genres = emptySet<String>()
++    private var tags = emptySet<String>()
++    private var publishers = emptySet<String>()
++    private var authors = emptyMap<String, List<AuthorDto>>() // roles to list of authors
++
++    private var fetchFilterStatus = FetchFilterStatus.NOT_FETCHED
++    private var fetchFiltersAttempts = 0
++    private val scope = CoroutineScope(Dispatchers.IO)
++
++    private fun fetchFilterOptions() {
++        if (baseUrl.isBlank() || fetchFilterStatus != FetchFilterStatus.NOT_FETCHED || fetchFiltersAttempts >= 3) {
++            return
++        }
++
++        fetchFilterStatus = FetchFilterStatus.FETCHING
++        fetchFiltersAttempts++
++
++        scope.launch {
++            try {
++                libraries = client.newCall(GET("$baseUrl/api/v1/libraries", headers)).await().parseAs()
++                collections = client
++                    .newCall(GET("$baseUrl/api/v1/collections?unpaged=true", headers))
++                    .await()
++                    .parseAs<PageWrapperDto<CollectionDto>>()
++                    .content
++                genres = client.newCall(GET("$baseUrl/api/v1/genres", headers)).await().parseAs()
++                tags = client.newCall(GET("$baseUrl/api/v1/tags", headers)).await().parseAs()
++                publishers = client.newCall(GET("$baseUrl/api/v1/publishers", headers)).await().parseAs()
++                authors = client
++                    .newCall(GET("$baseUrl/api/v1/authors", headers))
++                    .await()
++                    .parseAs<List<AuthorDto>>()
++                    .groupBy { it.role }
++                fetchFilterStatus = FetchFilterStatus.FETCHED
++            } catch (e: Exception) {
++                fetchFilterStatus = FetchFilterStatus.NOT_FETCHED
++                Log.e(logTag, "Failed to fetch filtering options", e)
++            }
++        }
++    }
++
++    fun String.isFromReadList() = contains("/api/v1/readlists")
++
++    fun String.isFromBook() = contains("/api/v1/books")
++
++    fun Response.isFromReadList() = request.url.toString().isFromReadList()
++
++    fun Response.isFromBook() = request.url.toString().isFromBook()
++
++    private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
++
++    private val logTag = "komga"
++
++    companion object {
++
++        internal const val TYPE_SERIES = "Series"
++        internal const val TYPE_READLISTS = "Read lists"
++        internal const val TYPE_BOOKS = "Books"
++    }
++}
++
++private enum class FetchFilterStatus {
++    NOT_FETCHED,
++    FETCHING,
++    FETCHED,
++}
++
++// Stable identities retained from the upstream extension build metadata.
++internal val BUILT_IN_KOMGA_INSTANCE_IDS =
++    listOf(4508733312114627536L, 8074481155021144106L, 5132811728275817394L)
++
++private const val PREF_DISPLAY_NAME = "Source display name"
++private const val PREF_ADDRESS = "Address"
++private const val PREF_USERNAME = "Username"
++private const val PREF_PASSWORD = "Password"
++private const val PREF_API_KEY = "API key"
++private const val PREF_DEFAULT_LIBRARIES = "Default libraries"
++private const val PREF_CHAPTER_NAME_TEMPLATE = "Chapter name template"
++private const val PREF_CHAPTER_NAME_TEMPLATE_DEFAULT = "{number} - {title} ({size})"
++
++private val SUPPORTED_IMAGE_TYPES = listOf("image/jpeg", "image/png", "image/gif", "image/webp", "image/jxl", "image/heif", "image/avif")
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaFilters.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaFilters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..5faa27acb872b608ca9f297a52b73787300b76d8
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaFilters.kt
+@@ -0,0 +1,121 @@
++/*
++ * Adapted from keiyoushi/extensions-source at
++ * 9f2565708438fbbcbe86d5c0f120571b0de0bbc7.
++ * Licensed under the Apache License, Version 2.0.
++ */
++package eu.kanade.tachiyomi.extension.all.komga
++
++import eu.kanade.tachiyomi.extension.all.komga.dto.AuthorDto
++import eu.kanade.tachiyomi.extension.all.komga.dto.LibraryDto
++import eu.kanade.tachiyomi.source.model.Filter
++import okhttp3.HttpUrl
++
++interface UriFilter {
++    fun addToUri(builder: HttpUrl.Builder)
++}
++
++internal class TypeSelect :
++    Filter.Select<String>(
++        "Search for",
++        arrayOf(
++            Komga.TYPE_SERIES,
++            Komga.TYPE_READLISTS,
++            Komga.TYPE_BOOKS,
++        ),
++    )
++
++internal class SeriesSort(selection: Selection? = null) :
++    Filter.Sort(
++        "Sort",
++        arrayOf("Relevance", "Alphabetically", "Date added", "Date updated", "Random"),
++        selection ?: Selection(0, true),
++    )
++
++internal class UnreadFilter :
++    Filter.CheckBox("Unread", false),
++    UriFilter {
++    override fun addToUri(builder: HttpUrl.Builder) {
++        if (!state) {
++            return
++        }
++
++        builder.addQueryParameter("read_status", "UNREAD")
++        builder.addQueryParameter("read_status", "IN_PROGRESS")
++    }
++}
++
++internal class InProgressFilter :
++    Filter.CheckBox("In Progress", false),
++    UriFilter {
++    override fun addToUri(builder: HttpUrl.Builder) {
++        if (!state) {
++            return
++        }
++
++        builder.addQueryParameter("read_status", "IN_PROGRESS")
++    }
++}
++
++internal class ReadFilter :
++    Filter.CheckBox("Read", false),
++    UriFilter {
++    override fun addToUri(builder: HttpUrl.Builder) {
++        if (!state) {
++            return
++        }
++
++        builder.addQueryParameter("read_status", "READ")
++    }
++}
++
++internal class LibraryFilter(
++    libraries: List<LibraryDto>,
++    defaultLibraries: Set<String>,
++) : UriMultiSelectFilter(
++    "Libraries",
++    "library_id",
++    libraries.map {
++        UriMultiSelectOption(it.name, it.id).apply {
++            state = defaultLibraries.contains(it.id)
++        }
++    },
++)
++
++internal class UriMultiSelectOption(name: String, val id: String = name) : Filter.CheckBox(name, false)
++
++internal open class UriMultiSelectFilter(
++    name: String,
++    private val param: String,
++    genres: List<UriMultiSelectOption>,
++) : Filter.Group<UriMultiSelectOption>(name, genres),
++    UriFilter {
++    override fun addToUri(builder: HttpUrl.Builder) {
++        val whatToInclude = state.filter { it.state }.map { it.id }
++
++        if (whatToInclude.isNotEmpty()) {
++            builder.addQueryParameter(param, whatToInclude.joinToString(","))
++        }
++    }
++}
++
++internal class AuthorFilter(val author: AuthorDto) : Filter.CheckBox(author.name, false)
++
++internal class AuthorGroup(
++    role: String,
++    authors: List<AuthorFilter>,
++) : Filter.Group<AuthorFilter>(role.replaceFirstChar { it.titlecase() }, authors),
++    UriFilter {
++    override fun addToUri(builder: HttpUrl.Builder) {
++        val authorToInclude = state.filter { it.state }.map { it.author }
++
++        authorToInclude.forEach {
++            builder.addQueryParameter("author", "${it.name},${it.role}")
++        }
++    }
++}
++
++internal class CollectionSelect(
++    val collections: List<CollectionFilterEntry>,
++) : Filter.Select<String>("Collection", collections.map { it.name }.toTypedArray())
++
++internal data class CollectionFilterEntry(val name: String, val id: String? = null)
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaUtils.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaUtils.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..812671a69c2b135b5ec0bf0701abc271b918246f
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/KomgaUtils.kt
+@@ -0,0 +1,61 @@
++/*
++ * Adapted from keiyoushi/extensions-source at
++ * 9f2565708438fbbcbe86d5c0f120571b0de0bbc7.
++ * Licensed under the Apache License, Version 2.0.
++ */
++package eu.kanade.tachiyomi.extension.all.komga
++
++import androidx.preference.EditTextPreference
++import androidx.preference.PreferenceScreen
++import java.text.ParseException
++import java.text.SimpleDateFormat
++import java.util.Locale
++import java.util.TimeZone
++
++val formatterDate = SimpleDateFormat("yyyy-MM-dd", Locale.US)
++    .apply { timeZone = TimeZone.getTimeZone("UTC") }
++val formatterDateTime = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
++    .apply { timeZone = TimeZone.getTimeZone("UTC") }
++
++fun parseDate(date: String): Long = try {
++    formatterDate.parse(date)!!.time
++} catch (_: ParseException) {
++    0L
++}
++
++fun parseDateTime(date: String) = try {
++    formatterDateTime.parse(date)!!.time
++} catch (_: ParseException) {
++    0L
++}
++
++fun PreferenceScreen.addEditTextPreference(
++    title: String,
++    default: String,
++    summary: String,
++    dialogMessage: String? = null,
++    validate: ((String) -> Boolean)? = null,
++    validationMessage: String? = null,
++    key: String = title,
++    restartRequired: Boolean = false,
++) {
++    EditTextPreference(context).apply {
++        this.key = key
++        this.title = title
++        this.summary = summary
++        this.setDefaultValue(default)
++        dialogTitle = title
++        this.dialogMessage = dialogMessage
++
++        setOnPreferenceChangeListener { _, newValue ->
++            try {
++                val text = newValue as String
++                val result = text.isBlank() || validate?.invoke(text) ?: true
++                result
++            } catch (e: Exception) {
++                e.printStackTrace()
++                false
++            }
++        }
++    }.also(::addPreference)
++}
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/Dto.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/Dto.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e0155699accd13e17a762b909e9f640d2a881f9
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/Dto.kt
+@@ -0,0 +1,208 @@
++/*
++ * Adapted from keiyoushi/extensions-source at
++ * 9f2565708438fbbcbe86d5c0f120571b0de0bbc7.
++ * Licensed under the Apache License, Version 2.0.
++ */
++package eu.kanade.tachiyomi.extension.all.komga.dto
++
++import eu.kanade.tachiyomi.source.model.SManga
++import kotlinx.serialization.Serializable
++import org.apache.commons.text.StringSubstitutor
++
++interface ConvertibleToSManga {
++    fun toSManga(baseUrl: String): SManga
++}
++
++@Serializable
++class LibraryDto(
++    val id: String,
++    val name: String,
++)
++
++@Serializable
++class SeriesDto(
++    val id: String,
++    val libraryId: String,
++    val name: String,
++    val created: String?,
++    val lastModified: String?,
++    val fileLastModified: String,
++    val booksCount: Int,
++    val metadata: SeriesMetadataDto,
++    val booksMetadata: BookMetadataAggregationDto,
++) : ConvertibleToSManga {
++    override fun toSManga(baseUrl: String) = SManga.create().apply {
++        title = metadata.title
++        url = "$baseUrl/api/v1/series/$id"
++        thumbnail_url = "$url/thumbnail"
++        status = when {
++            metadata.status == "ENDED" && metadata.totalBookCount != null && booksCount < metadata.totalBookCount -> SManga.PUBLISHING_FINISHED
++            metadata.status == "ENDED" -> SManga.COMPLETED
++            metadata.status == "ONGOING" -> SManga.ONGOING
++            metadata.status == "ABANDONED" -> SManga.CANCELLED
++            metadata.status == "HIATUS" -> SManga.ON_HIATUS
++            else -> SManga.UNKNOWN
++        }
++        genre = (metadata.genres + metadata.tags + booksMetadata.tags).sorted().distinct().joinToString(", ")
++        description = metadata.summary.ifBlank { booksMetadata.summary }
++        booksMetadata.authors.groupBy({ it.role }, { it.name }).let { map ->
++            author = map["writer"]?.distinct()?.joinToString()
++            artist = map["penciller"]?.distinct()?.joinToString()
++        }
++    }
++}
++
++@Serializable
++class SeriesMetadataDto(
++    val status: String,
++    val created: String?,
++    val lastModified: String?,
++    val title: String,
++    val titleSort: String,
++    val summary: String,
++    val summaryLock: Boolean,
++    val readingDirection: String,
++    val readingDirectionLock: Boolean,
++    val publisher: String,
++    val publisherLock: Boolean,
++    val ageRating: Int?,
++    val ageRatingLock: Boolean,
++    val language: String,
++    val languageLock: Boolean,
++    val genres: Set<String>,
++    val genresLock: Boolean,
++    val tags: Set<String>,
++    val tagsLock: Boolean,
++    val totalBookCount: Int? = null,
++)
++
++@Serializable
++class BookMetadataAggregationDto(
++    val authors: List<AuthorDto> = emptyList(),
++    val tags: Set<String> = emptySet(),
++    val releaseDate: String?,
++    val summary: String,
++    val summaryNumber: String,
++
++    val created: String,
++    val lastModified: String,
++)
++
++@Serializable
++class BookDto(
++    val id: String,
++    val seriesId: String,
++    val seriesTitle: String,
++    val name: String,
++    val number: Float,
++    val created: String?,
++    val lastModified: String?,
++    val fileLastModified: String,
++    val sizeBytes: Long,
++    val size: String,
++    val media: MediaDto,
++    val metadata: BookMetadataDto,
++) : ConvertibleToSManga {
++    fun getChapterName(template: String, isFromReadList: Boolean): String {
++        val values = hashMapOf(
++            "title" to metadata.title,
++            "seriesTitle" to seriesTitle,
++            "number" to metadata.number,
++            "createdDate" to created,
++            "releaseDate" to metadata.releaseDate,
++            "size" to size,
++            "sizeBytes" to sizeBytes.toString(),
++        )
++        val sub = StringSubstitutor(values, "{", "}")
++
++        return buildString {
++            if (isFromReadList) {
++                append(seriesTitle)
++                append(" ")
++            }
++
++            append(sub.replace(template))
++        }
++    }
++
++    override fun toSManga(baseUrl: String) = SManga.create().apply {
++        title = metadata.title
++        url = "$baseUrl/api/v1/books/$id"
++        thumbnail_url = "$url/thumbnail"
++        status = SManga.UNKNOWN
++        genre = metadata.tags.distinct().joinToString(", ")
++        description = metadata.summary
++        author = metadata.authors.joinToString { it.name }
++        artist = author
++    }
++}
++
++@Serializable
++class MediaDto(
++    val status: String,
++    val mediaType: String,
++    val pagesCount: Int,
++    val mediaProfile: String = "DIVINA",
++    val epubDivinaCompatible: Boolean = false,
++)
++
++@Serializable
++class PageDto(
++    val number: Int,
++    val fileName: String,
++    val mediaType: String,
++)
++
++@Serializable
++class BookMetadataDto(
++    val title: String,
++    val titleLock: Boolean,
++    val summary: String,
++    val summaryLock: Boolean,
++    val number: String,
++    val numberLock: Boolean,
++    val numberSort: Float,
++    val numberSortLock: Boolean,
++    val releaseDate: String?,
++    val releaseDateLock: Boolean,
++    val authors: List<AuthorDto>,
++    val authorsLock: Boolean,
++    val tags: Set<String>,
++    val tagsLock: Boolean,
++)
++
++@Serializable
++class AuthorDto(
++    val name: String,
++    val role: String,
++)
++
++@Serializable
++class CollectionDto(
++    val id: String,
++    val name: String,
++    val ordered: Boolean,
++    val seriesIds: List<String>,
++    val createdDate: String,
++    val lastModifiedDate: String,
++    val filtered: Boolean,
++)
++
++@Serializable
++class ReadListDto(
++    val id: String,
++    val name: String,
++    val summary: String,
++    val bookIds: List<String>,
++    val createdDate: String,
++    val lastModifiedDate: String,
++    val filtered: Boolean,
++) : ConvertibleToSManga {
++    override fun toSManga(baseUrl: String) = SManga.create().apply {
++        title = name
++        description = summary
++        url = "$baseUrl/api/v1/readlists/$id"
++        thumbnail_url = "$url/thumbnail"
++        status = SManga.UNKNOWN
++    }
++}
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/PageWrapperDto.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/PageWrapperDto.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..4fedda54b54a9db48f39bdf8fbf78b99df8a98d3
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/extension/all/komga/dto/PageWrapperDto.kt
+@@ -0,0 +1,21 @@
++/*
++ * Adapted from keiyoushi/extensions-source at
++ * 9f2565708438fbbcbe86d5c0f120571b0de0bbc7.
++ * Licensed under the Apache License, Version 2.0.
++ */
++package eu.kanade.tachiyomi.extension.all.komga.dto
++
++import kotlinx.serialization.Serializable
++
++@Serializable
++class PageWrapperDto<T>(
++    val content: List<T>,
++    val empty: Boolean,
++    val first: Boolean,
++    val last: Boolean,
++    val number: Long,
++    val numberOfElements: Long,
++    val size: Long,
++    val totalElements: Long,
++    val totalPages: Long,
++)
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/ExtensionDataLoader.kt b/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/ExtensionDataLoader.kt
+index 7701e4e5ae32614ab8de8766a968d22b62eaa09a..2f3b624035dc6ace4ed8c3564c3b4023a82cbd8b 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/ExtensionDataLoader.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/ExtensionDataLoader.kt
+@@ -12,10 +12,13 @@ import graphql.GraphQLContext
+ import org.dataloader.DataLoader
+ import org.dataloader.DataLoaderFactory
+ import org.jetbrains.exposed.v1.core.Slf4jSqlDebugLogger
++import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.inList
++import org.jetbrains.exposed.v1.core.neq
+ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import suwayomi.tachidesk.graphql.types.ExtensionType
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.model.table.ExtensionTable
+ import suwayomi.tachidesk.manga.model.table.SourceTable
+ import suwayomi.tachidesk.server.JavalinSetup.future
+@@ -31,7 +34,10 @@ class ExtensionDataLoader : KotlinDataLoader<String, ExtensionType> {
+                     val extensions =
+                         ExtensionTable
+                             .selectAll()
+-                            .where { ExtensionTable.pkgName inList ids }
++                            .where {
++                                (ExtensionTable.pkgName inList ids) and
++                                    (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
++                            }
+                             .map { ExtensionType(it) }
+                             .associateBy { it.pkgName }
+                     ids.map { extensions[it] }
+@@ -52,7 +58,10 @@ class ExtensionForSourceDataLoader : KotlinDataLoader<Long, ExtensionType> {
+                         ExtensionTable
+                             .innerJoin(SourceTable)
+                             .selectAll()
+-                            .where { SourceTable.id inList ids }
++                            .where {
++                                (SourceTable.id inList ids) and
++                                    (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
++                            }
+                             .toList()
+                             .map { Triple(it[SourceTable.id].value, it[ExtensionTable.pkgName], it) }
+                             .let { triples ->
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/SourceDataLoader.kt b/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/SourceDataLoader.kt
+index 6b9dd05a218c6a7354983d58ae38377b75382599..9f982f75288efa59face9a4dd83b3c63453b8d08 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/SourceDataLoader.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/graphql/dataLoaders/SourceDataLoader.kt
+@@ -12,12 +12,15 @@ import graphql.GraphQLContext
+ import org.dataloader.DataLoader
+ import org.dataloader.DataLoaderFactory
+ import org.jetbrains.exposed.v1.core.Slf4jSqlDebugLogger
++import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.inList
++import org.jetbrains.exposed.v1.core.neq
+ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import suwayomi.tachidesk.graphql.types.SourceNodeList
+ import suwayomi.tachidesk.graphql.types.SourceNodeList.Companion.toNodeList
+ import suwayomi.tachidesk.graphql.types.SourceType
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.model.table.ExtensionTable
+ import suwayomi.tachidesk.manga.model.table.SourceTable
+ import suwayomi.tachidesk.server.JavalinSetup.future
+@@ -55,7 +58,10 @@ class SourcesForExtensionDataLoader : KotlinDataLoader<String, SourceNodeList> {
+                         SourceTable
+                             .innerJoin(ExtensionTable)
+                             .selectAll()
+-                            .where { ExtensionTable.pkgName inList ids }
++                            .where {
++                                (ExtensionTable.pkgName inList ids) and
++                                    (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
++                            }
+                             .map { Pair(it[ExtensionTable.pkgName], SourceType(it)) }
+                             .groupBy { it.first }
+                             .mapValues { it.value.mapNotNull { pair -> pair.second } }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/graphql/mutations/ExtensionMutation.kt b/server/src/main/kotlin/suwayomi/tachidesk/graphql/mutations/ExtensionMutation.kt
+index b81619319e6165c35d98a4e66268bc12013058d4..f8cda641d813d038e19f44f28263599b6207f28b 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/graphql/mutations/ExtensionMutation.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/graphql/mutations/ExtensionMutation.kt
+@@ -4,6 +4,7 @@ package suwayomi.tachidesk.graphql.mutations
+ 
+ import eu.kanade.tachiyomi.source.local.LocalSource
+ import io.javalin.http.UploadedFile
++import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.eq
+ import org.jetbrains.exposed.v1.core.inList
+ import org.jetbrains.exposed.v1.core.neq
+@@ -12,6 +13,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import suwayomi.tachidesk.graphql.directives.RequireAuth
+ import suwayomi.tachidesk.graphql.types.ExtensionStoreType
+ import suwayomi.tachidesk.graphql.types.ExtensionType
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.impl.extension.Extension
+ import suwayomi.tachidesk.manga.impl.extension.ExtensionsList
+ import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
+@@ -52,6 +54,7 @@ class ExtensionMutation {
+         ids: List<String>,
+         patch: UpdateExtensionPatch,
+     ) {
++        ids.forEach(BuiltInKomgaLifecycle::rejectExtensionMutation)
+         val extensions =
+             transaction {
+                 ExtensionTable
+@@ -145,7 +148,10 @@ class ExtensionMutation {
+                 transaction {
+                     ExtensionTable
+                         .selectAll()
+-                        .where { ExtensionTable.name neq LocalSource.EXTENSION_NAME }
++                        .where {
++                            (ExtensionTable.name neq LocalSource.EXTENSION_NAME) and
++                                (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
++                        }
+                         .map { ExtensionType(it) }
+                 }
+ 
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/graphql/queries/ExtensionQuery.kt b/server/src/main/kotlin/suwayomi/tachidesk/graphql/queries/ExtensionQuery.kt
+index 876bb7ddbce1adf5a4bf17c64aa75019d832dfb7..9f75e8437722d71200a254ba6fb62889c4eb64f5 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/graphql/queries/ExtensionQuery.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/graphql/queries/ExtensionQuery.kt
+@@ -14,6 +14,7 @@ import graphql.schema.DataFetchingEnvironment
+ import org.jetbrains.exposed.v1.core.Column
+ import org.jetbrains.exposed.v1.core.Op
+ import org.jetbrains.exposed.v1.core.SortOrder
++import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.greater
+ import org.jetbrains.exposed.v1.core.less
+ import org.jetbrains.exposed.v1.core.neq
+@@ -43,6 +44,7 @@ import suwayomi.tachidesk.graphql.server.primitives.lessNotUnique
+ import suwayomi.tachidesk.graphql.server.primitives.maybeSwap
+ import suwayomi.tachidesk.graphql.types.ExtensionNodeList
+ import suwayomi.tachidesk.graphql.types.ExtensionType
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
+ import suwayomi.tachidesk.manga.model.table.ExtensionTable
+ import java.util.concurrent.CompletableFuture
+@@ -215,7 +217,10 @@ class ExtensionQuery {
+             transaction {
+                 val res = ExtensionTable.selectAll()
+ 
+-                res.adjustWhere { ExtensionTable.name neq LocalSource.EXTENSION_NAME }
++                res.adjustWhere {
++                    (ExtensionTable.name neq LocalSource.EXTENSION_NAME) and
++                        (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
++                }
+ 
+                 res.applyOps(condition, filter)
+ 
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+index 40af6e9d70d30af89f32731a1e283fd2d8dd7224..c8599761f1e2ad42cb26d7f6d571eb013b4fc59b 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+@@ -16,6 +16,7 @@ import io.javalin.apibuilder.ApiBuilder.post
+ import io.javalin.apibuilder.ApiBuilder.put
+ import io.javalin.apibuilder.ApiBuilder.ws
+ import suwayomi.tachidesk.manga.controller.BackupController
++import suwayomi.tachidesk.manga.controller.BuiltInKomgaController
+ import suwayomi.tachidesk.manga.controller.CategoryController
+ import suwayomi.tachidesk.manga.controller.DownloadController
+ import suwayomi.tachidesk.manga.controller.ExtensionController
+@@ -192,6 +193,8 @@ object MangaAPI {
+         }
+ 
+         path("gomanga") {
++            post("builtin-komga/{sourceId}/activate", BuiltInKomgaController.activate)
++            post("builtin-komga/{sourceId}/deactivate", BuiltInKomgaController.deactivate)
+             // host-owned-cookie-routing 4.1: proactive host->server cookie seed.
+             post("cf-cookies", MangaController.cfCookieSeed)
+             // GoMangaStableDefaultUA: set the server's stable ecosystem source
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/BuiltInKomgaController.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/BuiltInKomgaController.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ad98041df88b067d465aefb1314330cdef50d31
+--- /dev/null
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/BuiltInKomgaController.kt
+@@ -0,0 +1,58 @@
++package suwayomi.tachidesk.manga.controller
++
++/*
++ * Copyright (C) Contributors to the GoManga project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     https://www.apache.org/licenses/LICENSE-2.0
++ */
++
++import io.javalin.http.Context
++import io.javalin.http.Handler
++import io.javalin.http.HttpStatus
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaInvalidSourceId
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycleUnavailable
++
++data class BuiltInKomgaLifecycleErrorResponse(
++    val code: String,
++    val message: String,
++    val sourceId: String? = null,
++)
++
++object BuiltInKomgaController {
++    val activate = Handler { context -> mutate(context, BuiltInKomgaLifecycle::activate) }
++    val deactivate = Handler { context -> mutate(context, BuiltInKomgaLifecycle::deactivate) }
++
++    private fun mutate(
++        context: Context,
++        operation: (String) -> Any,
++    ) {
++        val sourceId = context.pathParam("sourceId")
++        try {
++            context.json(operation(sourceId))
++        } catch (error: BuiltInKomgaInvalidSourceId) {
++            context
++                .status(HttpStatus.BAD_REQUEST)
++                .json(
++                    BuiltInKomgaLifecycleErrorResponse(
++                        code = "invalid_source_id",
++                        sourceId = error.sourceId,
++                        message = error.message ?: "source id is not a built-in Komga slot",
++                    ),
++                )
++        } catch (error: BuiltInKomgaLifecycleUnavailable) {
++            context
++                .status(HttpStatus.SERVICE_UNAVAILABLE)
++                .json(
++                    BuiltInKomgaLifecycleErrorResponse(
++                        code = "lifecycle_unavailable",
++                        message = error.message ?: "built-in Komga factory failed to initialize",
++                    ),
++                )
++        }
++    }
++}
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycle.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycle.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..029394775b49913d9af988c2750de74915f8b567
+--- /dev/null
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycle.kt
+@@ -0,0 +1,392 @@
++package suwayomi.tachidesk.manga.impl.builtin.komga
++
++/*
++ * Copyright (C) Contributors to the GoManga project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     https://www.apache.org/licenses/LICENSE-2.0
++ */
++
++import io.github.oshai.kotlinlogging.KotlinLogging
++import org.jetbrains.exposed.v1.core.ResultRow
++import org.jetbrains.exposed.v1.core.and
++import org.jetbrains.exposed.v1.core.eq
++import org.jetbrains.exposed.v1.core.inList
++import org.jetbrains.exposed.v1.jdbc.deleteWhere
++import org.jetbrains.exposed.v1.jdbc.insert
++import org.jetbrains.exposed.v1.jdbc.insertAndGetId
++import org.jetbrains.exposed.v1.jdbc.selectAll
++import org.jetbrains.exposed.v1.jdbc.transactions.transaction
++import org.jetbrains.exposed.v1.jdbc.update
++import suwayomi.tachidesk.manga.impl.Source
++import suwayomi.tachidesk.manga.impl.util.PackageTools
++import suwayomi.tachidesk.manga.impl.util.source.GetSource
++import suwayomi.tachidesk.manga.model.table.ExtensionTable
++import suwayomi.tachidesk.manga.model.table.SourceTable
++import suwayomi.tachidesk.server.ApplicationDirs
++import uy.kohesive.injekt.injectLazy
++import java.io.File
++import kotlin.io.path.Path
++import kotlin.io.path.absolutePathString
++import kotlin.io.path.deleteIfExists
++import kotlin.io.path.div
++
++data class BuiltInKomgaLifecycleState(
++    val sourceId: String,
++    val active: Boolean,
++    val activeSourceIds: List<String>,
++)
++
++class BuiltInKomgaInvalidSourceId(
++    val sourceId: String,
++) : IllegalArgumentException("source id is not a built-in Komga slot")
++
++class BuiltInKomgaLifecycleUnavailable(
++    message: String,
++    cause: Throwable? = null,
++) : IllegalStateException(message, cause)
++
++class BuiltInKomgaExtensionMutationRejected :
++    IllegalArgumentException("the built-in Komga provider is not extension-management content")
++
++/**
++ * Persistent activation boundary for the three bundled Komga slots.
++ *
++ * The provider classes are always present. A slot is active only when its
++ * [SourceTable] row points at the hidden sentinel extension row.
++ */
++object BuiltInKomgaLifecycle {
++    const val packageId = "eu.kanade.tachiyomi.extension.all.komga"
++    const val sentinelClassName =
++        "suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaProviderFactory"
++
++    val allowedSourceIds: List<Long> =
++        BuiltInKomgaProviderFactory.slots.map(BuiltInKomgaProviderFactory.Slot::sourceId)
++
++    @Volatile
++    var isInitialized: Boolean = false
++        private set
++
++    private val logger = KotlinLogging.logger {}
++    private val applicationDirs: ApplicationDirs by injectLazy()
++
++    private data class InitializationPlan(
++        val sourceIdsToUnregister: Set<Long>,
++        val activeSourceIds: List<Long>,
++        val legacyApkNames: Set<String>,
++    )
++
++    @Synchronized
++    fun initialize() {
++        isInitialized = false
++        try {
++            if (
++                System.getProperty(
++                    "suwayomi.tachidesk.gomanga.failBuiltInKomgaLifecycleInit",
++                    "false",
++                ) == "true"
++            ) {
++                throw BuiltInKomgaLifecycleUnavailable(
++                    "built-in Komga factory failed to initialize",
++                )
++            }
++
++            BuiltInKomgaProviderFactory.validate()
++            val plan = transaction { initializePersistence() }
++
++            plan.sourceIdsToUnregister.forEach(GetSource::unregisterSource)
++            removeLegacyProviderJars(plan.legacyApkNames)
++            ensureBundledIcon()
++            plan.activeSourceIds.forEach { sourceId ->
++                GetSource.registerSource(sourceId to BuiltInKomgaProviderFactory.create(sourceId))
++            }
++            isInitialized = true
++        } catch (error: BuiltInKomgaLifecycleUnavailable) {
++            throw error
++        } catch (error: Throwable) {
++            throw BuiltInKomgaLifecycleUnavailable(
++                "built-in Komga factory failed to initialize",
++                error,
++            )
++        }
++    }
++
++    @Synchronized
++    fun activate(sourceId: Long): BuiltInKomgaLifecycleState {
++        requireInitialized()
++        val slot =
++            BuiltInKomgaProviderFactory.slot(sourceId)
++                ?: throw BuiltInKomgaInvalidSourceId(sourceId.toString())
++        val source = BuiltInKomgaProviderFactory.create(sourceId)
++
++        transaction {
++            val sentinelId = ensureSentinel()
++            val existing = SourceTable.selectAll().where { SourceTable.id eq sourceId }.firstOrNull()
++            if (existing == null) {
++                insertSource(slot, sentinelId.value)
++            } else if (existing[SourceTable.extension] != sentinelId) {
++                SourceTable.deleteWhere { SourceTable.id eq sourceId }
++                insertSource(slot, sentinelId.value)
++            } else {
++                SourceTable.update({ SourceTable.id eq sourceId }) {
++                    it[name] = slot.defaultName
++                    it[lang] = "all"
++                    it[contentWarning] = 0
++                }
++            }
++        }
++
++        GetSource.registerSource(sourceId to source)
++        return state(sourceId, active = true)
++    }
++
++    fun activate(sourceId: String): BuiltInKomgaLifecycleState {
++        val parsed =
++            sourceId
++                .takeIf { raw -> BuiltInKomgaProviderFactory.slots.any { it.sourceId.toString() == raw } }
++                ?.toLong()
++                ?: throw BuiltInKomgaInvalidSourceId(sourceId)
++        return activate(parsed)
++    }
++
++    @Synchronized
++    fun deactivate(sourceId: Long): BuiltInKomgaLifecycleState {
++        requireInitialized()
++        if (sourceId !in allowedSourceIds) {
++            throw BuiltInKomgaInvalidSourceId(sourceId.toString())
++        }
++
++        val cachedSource = GetSource.getSourceOrNull(sourceId)
++        GetSource.unregisterSource(sourceId)
++        try {
++            transaction {
++                val sentinelIds =
++                    ExtensionTable
++                        .selectAll()
++                        .where {
++                            (ExtensionTable.pkgName eq packageId) and
++                                (ExtensionTable.classFQName eq sentinelClassName)
++                        }.map { it[ExtensionTable.id] }
++                if (sentinelIds.isNotEmpty()) {
++                    SourceTable.deleteWhere {
++                        (SourceTable.id eq sourceId) and (SourceTable.extension inList sentinelIds)
++                    }
++                }
++            }
++        } catch (error: Throwable) {
++            if (cachedSource != null) {
++                GetSource.registerSource(sourceId to cachedSource)
++            }
++            throw error
++        }
++
++        Source.preferenceScreenMap.remove(sourceId)
++        BuiltInKomgaProviderFactory
++            .create(sourceId)
++            .getSourcePreferences()
++            .edit()
++            .clear()
++            .commit()
++        return state(sourceId, active = false)
++    }
++
++    fun deactivate(sourceId: String): BuiltInKomgaLifecycleState {
++        val parsed =
++            sourceId
++                .takeIf { raw -> BuiltInKomgaProviderFactory.slots.any { it.sourceId.toString() == raw } }
++                ?.toLong()
++                ?: throw BuiltInKomgaInvalidSourceId(sourceId)
++        return deactivate(parsed)
++    }
++
++    fun activeSourceIds(): List<Long> {
++        requireInitialized()
++        return transaction {
++            val sentinelIds =
++                ExtensionTable
++                    .selectAll()
++                    .where {
++                        (ExtensionTable.pkgName eq packageId) and
++                            (ExtensionTable.classFQName eq sentinelClassName)
++                    }.map { it[ExtensionTable.id] }
++            if (sentinelIds.isEmpty()) {
++                emptyList()
++            } else {
++                val active =
++                    SourceTable
++                        .selectAll()
++                        .where {
++                            (SourceTable.id inList allowedSourceIds) and
++                                (SourceTable.extension inList sentinelIds)
++                        }.map { it[SourceTable.id].value }
++                        .toSet()
++                allowedSourceIds.filter(active::contains)
++            }
++        }
++    }
++
++    fun isBuiltInPackage(pkgName: String): Boolean = pkgName == packageId
++
++    fun rejectExtensionMutation(pkgName: String) {
++        if (isBuiltInPackage(pkgName)) {
++            throw BuiltInKomgaExtensionMutationRejected()
++        }
++    }
++
++    fun isSentinel(row: ResultRow): Boolean =
++        row[ExtensionTable.pkgName] == packageId &&
++            row[ExtensionTable.classFQName] == sentinelClassName
++
++    private fun initializePersistence(): InitializationPlan {
++        val extensionRows =
++            ExtensionTable
++                .selectAll()
++                .where { ExtensionTable.pkgName eq packageId }
++                .toList()
++        val extensionIds = extensionRows.map { it[ExtensionTable.id] }
++        val sourceRows =
++            if (extensionIds.isEmpty()) {
++                emptyList()
++            } else {
++                SourceTable
++                    .selectAll()
++                    .where { SourceTable.extension inList extensionIds }
++                    .toList()
++            }
++        val sourceIdsToUnregister = sourceRows.map { it[SourceTable.id].value }.toSet()
++        val hasLegacyPayload = extensionRows.any { !isSentinel(it) || it[ExtensionTable.apkName] != null }
++        val persistedActiveIds =
++            if (hasLegacyPayload) {
++                emptyList()
++            } else {
++                val active = sourceRows.map { it[SourceTable.id].value }.toSet()
++                allowedSourceIds.filter(active::contains)
++            }
++        val legacyApkNames =
++            extensionRows
++                .mapNotNull { it[ExtensionTable.apkName] }
++                .toSet()
++
++        if (extensionIds.isNotEmpty()) {
++            SourceTable.deleteWhere { SourceTable.extension inList extensionIds }
++            ExtensionTable.deleteWhere { ExtensionTable.id inList extensionIds }
++        }
++        val sentinelId = ensureSentinel()
++        persistedActiveIds.forEach { sourceId ->
++            insertSource(
++                BuiltInKomgaProviderFactory.slot(sourceId)!!,
++                sentinelId.value,
++            )
++        }
++
++        return InitializationPlan(
++            sourceIdsToUnregister = sourceIdsToUnregister,
++            activeSourceIds = persistedActiveIds,
++            legacyApkNames = legacyApkNames,
++        )
++    }
++
++    private fun ensureSentinel() =
++        ExtensionTable
++            .selectAll()
++            .where {
++                (ExtensionTable.pkgName eq packageId) and
++                    (ExtensionTable.classFQName eq sentinelClassName)
++            }.firstOrNull()
++            ?.get(ExtensionTable.id)
++            ?.also { id ->
++                ExtensionTable.update({ ExtensionTable.id eq id }) {
++                    it[apkName] = null
++                    it[storeIndexUrl] = null
++                    it[iconUrl] = ""
++                    it[name] = "Komga built-in provider"
++                    it[pkgName] = packageId
++                    it[apkUrl] = null
++                    it[jarUrl] = null
++                    it[extensionLib] = "1.4"
++                    it[versionName] = "1.4.68"
++                    it[versionCode] = 68
++                    it[lang] = "all"
++                    it[contentWarning] = 0
++                    it[isInstalled] = true
++                    it[hasUpdate] = false
++                    it[isObsolete] = false
++                    it[classFQName] = sentinelClassName
++                }
++            }
++            ?: ExtensionTable.insertAndGetId {
++                it[apkName] = null
++                it[storeIndexUrl] = null
++                it[iconUrl] = ""
++                it[name] = "Komga built-in provider"
++                it[pkgName] = packageId
++                it[apkUrl] = null
++                it[jarUrl] = null
++                it[extensionLib] = "1.4"
++                it[versionName] = "1.4.68"
++                it[versionCode] = 68
++                it[lang] = "all"
++                it[contentWarning] = 0
++                it[isInstalled] = true
++                it[hasUpdate] = false
++                it[isObsolete] = false
++                it[classFQName] = sentinelClassName
++            }
++
++    private fun insertSource(
++        slot: BuiltInKomgaProviderFactory.Slot,
++        extensionId: Int,
++    ) {
++        SourceTable.insert {
++            it[id] = slot.sourceId
++            it[name] = slot.defaultName
++            it[lang] = "all"
++            it[extension] = extensionId
++            it[contentWarning] = 0
++        }
++    }
++
++    private fun state(
++        sourceId: Long,
++        active: Boolean,
++    ) = BuiltInKomgaLifecycleState(
++        sourceId = sourceId.toString(),
++        active = active,
++        activeSourceIds = activeSourceIds().map(Long::toString),
++    )
++
++    private fun requireInitialized() {
++        if (!isInitialized) {
++            throw BuiltInKomgaLifecycleUnavailable(
++                "built-in Komga factory failed to initialize",
++            )
++        }
++    }
++
++    private fun removeLegacyProviderJars(apkNames: Set<String>) {
++        apkNames.forEach { apkName ->
++            val jarName = apkName.substringBeforeLast(".apk") + ".jar"
++            val jarPath = Path(applicationDirs.extensionsRoot) / jarName
++            PackageTools.jarLoaderMap.remove(jarPath.absolutePathString())?.close()
++            jarPath.deleteIfExists()
++        }
++    }
++
++    private fun ensureBundledIcon() {
++        val iconDirectory = File(applicationDirs.extensionsRoot, "icon")
++        iconDirectory.mkdirs()
++        val iconFile = File(iconDirectory, "$packageId.png")
++        val input =
++            BuiltInKomgaLifecycle::class.java.getResourceAsStream("/icon/komga.png")
++                ?: throw BuiltInKomgaLifecycleUnavailable(
++                    "built-in Komga icon failed to initialize",
++                )
++        input.use { source ->
++            iconFile.outputStream().use { output -> source.copyTo(output) }
++        }
++        logger.debug { "Cached bundled Komga provider icon" }
++    }
++}
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaProviderFactory.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaProviderFactory.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..16e81f50e62645ac7ec0d34797a74498fe5dd8ad
+--- /dev/null
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaProviderFactory.kt
+@@ -0,0 +1,53 @@
++package suwayomi.tachidesk.manga.impl.builtin.komga
++
++/*
++ * Copyright (C) Contributors to the GoManga project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     https://www.apache.org/licenses/LICENSE-2.0
++ */
++
++import eu.kanade.tachiyomi.extension.all.komga.BUILT_IN_KOMGA_INSTANCE_IDS
++import eu.kanade.tachiyomi.extension.all.komga.Komga
++
++/**
++ * Server-owned factory for the bundled provider.
++ *
++ * Payload availability is intentionally separate from source activation:
++ * callers must request one allowlisted slot through [BuiltInKomgaLifecycle].
++ */
++object BuiltInKomgaProviderFactory {
++    data class Slot(
++        val sourceId: Long,
++        val defaultName: String,
++    )
++
++    val slots: List<Slot> =
++        listOf(
++            Slot(4508733312114627536L, "Komga"),
++            Slot(8074481155021144106L, "Komga (2)"),
++            Slot(5132811728275817394L, "Komga (3)"),
++        )
++
++    init {
++        check(slots.map(Slot::sourceId) == BUILT_IN_KOMGA_INSTANCE_IDS)
++        check(slots.map(Slot::sourceId).distinct().size == slots.size)
++    }
++
++    fun slot(sourceId: Long): Slot? = slots.firstOrNull { it.sourceId == sourceId }
++
++    fun create(sourceId: Long): Komga {
++        if (slot(sourceId) == null) {
++            throw BuiltInKomgaInvalidSourceId(sourceId.toString())
++        }
++        return Komga(lang = "all", id = sourceId)
++    }
++
++    fun validate() {
++        check(slots.size == 3)
++        check(slots.map(Slot::defaultName) == listOf("Komga", "Komga (2)", "Komga (3)"))
++    }
++}
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
+index be98859d39e8a75925285342f1a2f3502d7e8822..1b9b35b2736415e385b6f3994dbcaba03167daa3 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/Extension.kt
+@@ -26,6 +26,7 @@ import org.jetbrains.exposed.v1.jdbc.select
+ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import org.jetbrains.exposed.v1.jdbc.update
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.impl.util.AndroidManifestParser
+ import suwayomi.tachidesk.manga.impl.util.PackageTools
+ import suwayomi.tachidesk.manga.impl.util.PackageTools.EXTENSION_FEATURE
+@@ -87,6 +88,7 @@ object Extension {
+     }
+ 
+     suspend fun installExtension(pkgName: String): String {
++        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
+         logger.debug { "Installing $pkgName" }
+         val extension =
+             transaction {
+@@ -277,6 +279,10 @@ object Extension {
+         val extPackage = fetchPackage()
+         val metadata = extPackage.metadata
+         val pkgName = metadata.packageName
++        if (BuiltInKomgaLifecycle.isBuiltInPackage(pkgName)) {
++            extPackage.file.deleteIfExists()
++            BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
++        }
+ 
+         val isInstalled =
+             transaction {
+@@ -569,6 +575,7 @@ object Extension {
+     }
+ 
+     fun uninstallExtension(pkgName: String) {
++        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
+         logger.debug { "Uninstalling $pkgName" }
+ 
+         val extensionRecord = transaction { ExtensionTable.selectAll().where { ExtensionTable.pkgName eq pkgName }.first() }
+@@ -609,6 +616,7 @@ object Extension {
+     }
+ 
+     suspend fun updateExtension(pkgName: String): String {
++        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
+         val targetExtension = ExtensionsList.updateMap.remove(pkgName)!!
+         uninstallExtension(pkgName)
+         transaction {
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/ExtensionsList.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/ExtensionsList.kt
+index 20818aeac48d8f9a75d7a4b124ae1fa203414bdd..876528750786af122793568ec5b6fc204ddb6541 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/ExtensionsList.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/extension/ExtensionsList.kt
+@@ -21,6 +21,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import org.jetbrains.exposed.v1.jdbc.update
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.impl.extension.Extension.proxyExtensionIconUrl
+ import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
+ import suwayomi.tachidesk.manga.model.dataclass.ExtensionDataClass
+@@ -41,7 +42,9 @@ object ExtensionsList {
+         ExtensionStoreService.getAndRefresh().forEach { store ->
+             try {
+                 val extensions = ExtensionStoreService.getExtensions(store)
+-                allExtensions.addAll(extensions)
++                allExtensions.addAll(
++                    extensions.filterNot { BuiltInKomgaLifecycle.isBuiltInPackage(it.pkgName) },
++                )
+             } catch (e: Exception) {
+                 logger.warn(e) {
+                     "Failed to fetch extensions for store: ${store.indexUrl}"
+@@ -71,22 +74,27 @@ object ExtensionsList {
+ 
+     fun extensionTableAsDataClass() =
+         transaction {
+-            ExtensionTable.selectAll().filter { it[ExtensionTable.name] != LocalSource.EXTENSION_NAME }.map {
+-                ExtensionDataClass(
+-                    repo = it[ExtensionTable.storeIndexUrl],
+-                    apkName = it[ExtensionTable.apkName].orEmpty(),
+-                    iconUrl = proxyExtensionIconUrl(it[ExtensionTable.pkgName]),
+-                    name = it[ExtensionTable.name],
+-                    pkgName = it[ExtensionTable.pkgName],
+-                    versionName = it[ExtensionTable.versionName],
+-                    versionCode = it[ExtensionTable.versionCode].toInt(),
+-                    lang = it[ExtensionTable.lang],
+-                    isNsfw = it[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
+-                    installed = it[ExtensionTable.isInstalled],
+-                    hasUpdate = it[ExtensionTable.hasUpdate],
+-                    obsolete = it[ExtensionTable.isObsolete],
+-                )
+-            }
++            ExtensionTable
++                .selectAll()
++                .filter {
++                    it[ExtensionTable.name] != LocalSource.EXTENSION_NAME &&
++                        !BuiltInKomgaLifecycle.isBuiltInPackage(it[ExtensionTable.pkgName])
++                }.map {
++                    ExtensionDataClass(
++                        repo = it[ExtensionTable.storeIndexUrl],
++                        apkName = it[ExtensionTable.apkName].orEmpty(),
++                        iconUrl = proxyExtensionIconUrl(it[ExtensionTable.pkgName]),
++                        name = it[ExtensionTable.name],
++                        pkgName = it[ExtensionTable.pkgName],
++                        versionName = it[ExtensionTable.versionName],
++                        versionCode = it[ExtensionTable.versionCode].toInt(),
++                        lang = it[ExtensionTable.lang],
++                        isNsfw = it[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
++                        installed = it[ExtensionTable.isInstalled],
++                        hasUpdate = it[ExtensionTable.hasUpdate],
++                        obsolete = it[ExtensionTable.isObsolete],
++                    )
++                }
+         }
+ 
+     private val updateExtensionDatabaseMutex = Mutex()
+@@ -96,6 +104,7 @@ object ExtensionsList {
+             transaction {
+                 val uniqueExtensions =
+                     foundExtensions
++                        .filterNot { BuiltInKomgaLifecycle.isBuiltInPackage(it.pkgName) }
+                         .groupBy { it.pkgName }
+                         .mapValues { (_, extension) ->
+                             extension.maxBy { it.versionCode }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/source/GetSource.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/source/GetSource.kt
+index 522875876df09c99c2f8b10bd426e64790a73f53..dcb88516389f594e690271652ab895c497a8f3d7 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/source/GetSource.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/source/GetSource.kt
+@@ -14,6 +14,8 @@ import io.github.oshai.kotlinlogging.KotlinLogging
+ import org.jetbrains.exposed.v1.core.eq
+ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaProviderFactory
+ import suwayomi.tachidesk.manga.impl.util.PackageTools.loadExtensionSources
+ import suwayomi.tachidesk.manga.model.table.ExtensionTable
+ import suwayomi.tachidesk.manga.model.table.SourceTable
+@@ -46,6 +48,12 @@ object GetSource {
+                 ExtensionTable.selectAll().where { ExtensionTable.id eq extensionId }.first()
+             }
+ 
++        if (BuiltInKomgaLifecycle.isSentinel(extensionRecord)) {
++            val source = BuiltInKomgaProviderFactory.create(sourceId)
++            sourceCache[sourceId] = source
++            return source
++        }
++
+         val apkName =
+             extensionRecord[ExtensionTable.apkName]
+                 ?: throw NullPointerException("Missing apkName")
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt b/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
+index 9c496591a21a8439d1a69a2a1b8ceb0a92d33009..2bdb1bafa39e7a2c5bae80efef47c48e738b553c 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
+@@ -40,6 +40,7 @@ import suwayomi.tachidesk.global.impl.sync.SyncManager
+ import suwayomi.tachidesk.graphql.types.DatabaseType
+ import suwayomi.tachidesk.i18n.LocalizationHelper
+ import suwayomi.tachidesk.manga.impl.backup.proto.ProtoBackupExport
++import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+ import suwayomi.tachidesk.manga.impl.download.DownloadManager
+ import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
+ import suwayomi.tachidesk.manga.impl.update.IUpdater
+@@ -77,6 +78,15 @@ import kotlin.concurrent.thread
+ 
+ private val logger = KotlinLogging.logger {}
+ 
++private fun initializeBuiltInKomga() {
++    try {
++        BuiltInKomgaLifecycle.initialize()
++    } catch (error: Throwable) {
++        logger.error(error) { "Failed to initialize the built-in Komga provider" }
++        shutdownApp(ExitCode.BuiltInKomgaSetupFailure)
++    }
++}
++
+ class ApplicationDirs(
+     val dataRoot: String = ApplicationRootDir,
+     val tempRoot: String = "${System.getProperty("java.io.tmpdir")}/Tachidesk",
+@@ -456,6 +466,7 @@ fun applicationSetup() {
+         logger.error(e) { "Failed to setup LocalSource" }
+         shutdownApp(ExitCode.LocalSourceSetupFailure)
+     }
++    initializeBuiltInKomga()
+ 
+     if (!slimMode) {
+         serverConfig.subscribeTo(
+@@ -481,6 +492,7 @@ fun applicationSetup() {
+                 databaseUp()
+ 
+                 LocalSource.register()
++                initializeBuiltInKomga()
+             },
+             ignoreInitialValue = true,
+         )
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/server/util/AppExit.kt b/server/src/main/kotlin/suwayomi/tachidesk/server/util/AppExit.kt
+index 020c0b5cd89d02fa32f92e5a38c7855a62e97e41..50f5ad32755b90e15a19341270230326e70cca7e 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/server/util/AppExit.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/server/util/AppExit.kt
+@@ -25,6 +25,7 @@ enum class ExitCode(
+     LocalSourceIconCopyFailure(7),
+     LocalSourceSetupFailure(8),
+     MigrationsRunFailure(9),
++    BuiltInKomgaSetupFailure(10),
+ }
+ 
+ fun shutdownApp(exitCode: ExitCode) {
+diff --git a/server/src/main/resources/icon/komga.png b/server/src/main/resources/icon/komga.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3b751ca626b22ab71b489849cd578213d21f5ce
+GIT binary patch
+literal 17129
+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
+QasU7T07*qoM6N<$g4B6w>Hq)$
+
+literal 0
+HcmV?d00001
+
+diff --git a/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt b/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..47d6236e4073dbf50bdd126d37fca9a5eac75480
+--- /dev/null
++++ b/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt
+@@ -0,0 +1,120 @@
++package suwayomi.tachidesk.manga.impl.builtin.komga
++
++/*
++ * Copyright (C) Contributors to the GoManga project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.junit.jupiter.api.AfterEach
++import org.junit.jupiter.api.BeforeEach
++import org.junit.jupiter.api.Test
++import suwayomi.tachidesk.manga.impl.Source
++import suwayomi.tachidesk.manga.impl.extension.Extension
++import suwayomi.tachidesk.manga.impl.extension.ExtensionsList
++import suwayomi.tachidesk.manga.impl.util.source.GetSource
++import suwayomi.tachidesk.test.ApplicationTest
++import kotlin.test.assertEquals
++import kotlin.test.assertFailsWith
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class BuiltInKomgaLifecycleTest : ApplicationTest() {
++    private val first = 4508733312114627536L
++    private val second = 8074481155021144106L
++    private val third = 5132811728275817394L
++
++    @BeforeEach
++    fun resetBeforeTest() {
++        BuiltInKomgaLifecycle.initialize()
++        BuiltInKomgaLifecycle.allowedSourceIds.forEach(BuiltInKomgaLifecycle::deactivate)
++    }
++
++    @AfterEach
++    fun resetAfterTest() {
++        BuiltInKomgaLifecycle.allowedSourceIds.forEach(BuiltInKomgaLifecycle::deactivate)
++    }
++
++    @Test
++    fun `provider is ready but zero Komga sources are active by default`() {
++        assertTrue(BuiltInKomgaLifecycle.isInitialized)
++        assertEquals(emptyList(), BuiltInKomgaLifecycle.activeSourceIds())
++        assertNull(GetSource.getSourceOrNull(first))
++        assertNull(GetSource.getSourceOrNull(second))
++        assertNull(GetSource.getSourceOrNull(third))
++    }
++
++    @Test
++    fun `allowed slots activate and deactivate independently and idempotently`() {
++        val firstActivation = BuiltInKomgaLifecycle.activate(first)
++        val repeatedActivation = BuiltInKomgaLifecycle.activate(first)
++        BuiltInKomgaLifecycle.activate(second)
++
++        assertEquals(firstActivation, repeatedActivation)
++        assertEquals(listOf(first, second), BuiltInKomgaLifecycle.activeSourceIds())
++        assertNotNull(GetSource.getSourceOrNull(first))
++        assertNotNull(GetSource.getSourceOrNull(second))
++        assertTrue(Source.getSourcePreferences(first).isNotEmpty())
++
++        val deactivation = BuiltInKomgaLifecycle.deactivate(second)
++        val repeatedDeactivation = BuiltInKomgaLifecycle.deactivate(second)
++
++        assertEquals(deactivation, repeatedDeactivation)
++        assertEquals(listOf(first), BuiltInKomgaLifecycle.activeSourceIds())
++        assertNotNull(GetSource.getSourceOrNull(first))
++        assertNull(GetSource.getSourceOrNull(second))
++    }
++
++    @Test
++    fun `invalid id leaves the exact active set unchanged`() {
++        BuiltInKomgaLifecycle.activate(first)
++
++        assertFailsWith<BuiltInKomgaInvalidSourceId> {
++            BuiltInKomgaLifecycle.activate(42L)
++        }
++
++        assertEquals(listOf(first), BuiltInKomgaLifecycle.activeSourceIds())
++    }
++
++    @Test
++    fun `initialize after cache loss restores only persisted active rows`() {
++        BuiltInKomgaLifecycle.activate(first)
++        BuiltInKomgaLifecycle.activate(third)
++        GetSource.unregisterAllSources()
++
++        assertNull(GetSource.getSourceOrNull(second))
++        BuiltInKomgaLifecycle.initialize()
++
++        assertEquals(listOf(first, third), BuiltInKomgaLifecycle.activeSourceIds())
++        assertNotNull(GetSource.getSourceOrNull(first))
++        assertNull(GetSource.getSourceOrNull(second))
++        assertNotNull(GetSource.getSourceOrNull(third))
++    }
++
++    @Test
++    fun `built in package is hidden from extension inventory and uninstall`() {
++        BuiltInKomgaLifecycle.activate(first)
++
++        assertFalse(
++            ExtensionsList
++                .extensionTableAsDataClass()
++                .any { it.pkgName == BuiltInKomgaLifecycle.packageId },
++        )
++        assertFailsWith<BuiltInKomgaExtensionMutationRejected> {
++            Extension.uninstallExtension(BuiltInKomgaLifecycle.packageId)
++        }
++        assertEquals(listOf(first), BuiltInKomgaLifecycle.activeSourceIds())
++    }
++}
+diff --git a/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt b/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt
+index 4a946990e98f344514b50c681f3650609b669dde..6dd1d3595cd1a0beab7f245aa46f395c58af7705 100644
+--- a/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt
++++ b/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt
+@@ -1,17 +1,31 @@
+ package eu.kanade.tachiyomi.network.interceptor
+ 
++import okhttp3.Authenticator
++import okhttp3.Cache
+ import okhttp3.Call
++import okhttp3.CertificatePinner
+ import okhttp3.Connection
++import okhttp3.ConnectionPool
++import okhttp3.CookieJar
++import okhttp3.Dns
++import okhttp3.EventListener
+ import okhttp3.Handshake
+ import okhttp3.Interceptor
++import okhttp3.OkHttpClient
+ import okhttp3.Protocol
+ import okhttp3.Request
+ import okhttp3.Response
+ import okhttp3.ResponseBody.Companion.toResponseBody
+ import okhttp3.Route
+ import java.io.IOException
++import java.net.Proxy
++import java.net.ProxySelector
+ import java.net.Socket
+ import java.util.concurrent.TimeUnit
++import javax.net.SocketFactory
++import javax.net.ssl.HostnameVerifier
++import javax.net.ssl.SSLSocketFactory
++import javax.net.ssl.X509TrustManager
+ import kotlin.test.Test
+ import kotlin.test.assertEquals
+ import kotlin.test.assertFailsWith
+@@ -37,6 +51,8 @@ class CleartextGuardInterceptorTest {
+         private val request: Request,
+         private val connected: Boolean,
+     ) : Interceptor.Chain {
++        private val client = OkHttpClient()
++
+         var proceedCalled = false
+             private set
+ 
+@@ -62,6 +78,42 @@ class CleartextGuardInterceptorTest {
+         override fun withConnectTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
+         override fun withReadTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
+         override fun withWriteTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
++        override val followSslRedirects: Boolean get() = client.followSslRedirects
++        override val followRedirects: Boolean get() = client.followRedirects
++        override val dns: Dns get() = client.dns
++        override val socketFactory: SocketFactory get() = client.socketFactory
++        override val retryOnConnectionFailure: Boolean get() = client.retryOnConnectionFailure
++        override val authenticator: Authenticator get() = client.authenticator
++        override val cookieJar: CookieJar get() = client.cookieJar
++        override val cache: Cache? get() = client.cache
++        override val proxy: Proxy? get() = client.proxy
++        override val proxySelector: ProxySelector get() = client.proxySelector
++        override val proxyAuthenticator: Authenticator get() = client.proxyAuthenticator
++        override val sslSocketFactoryOrNull: SSLSocketFactory? get() = client.sslSocketFactory
++        override val x509TrustManagerOrNull: X509TrustManager? get() = client.x509TrustManager
++        override val hostnameVerifier: HostnameVerifier get() = client.hostnameVerifier
++        override val certificatePinner: CertificatePinner get() = client.certificatePinner
++        override val connectionPool: ConnectionPool get() = client.connectionPool
++        override val eventListener: EventListener get() = EventListener.NONE
++
++        override fun withDns(dns: Dns): Interceptor.Chain = this
++        override fun withSocketFactory(socketFactory: SocketFactory): Interceptor.Chain = this
++        override fun withRetryOnConnectionFailure(retryOnConnectionFailure: Boolean): Interceptor.Chain = this
++        override fun withAuthenticator(authenticator: Authenticator): Interceptor.Chain = this
++        override fun withCookieJar(cookieJar: CookieJar): Interceptor.Chain = this
++        override fun withCache(cache: Cache?): Interceptor.Chain = this
++        override fun withProxy(proxy: Proxy?): Interceptor.Chain = this
++        override fun withProxySelector(proxySelector: ProxySelector): Interceptor.Chain = this
++        override fun withProxyAuthenticator(proxyAuthenticator: Authenticator): Interceptor.Chain = this
++
++        override fun withSslSocketFactory(
++            sslSocketFactory: SSLSocketFactory?,
++            x509TrustManager: X509TrustManager?,
++        ): Interceptor.Chain = this
++
++        override fun withHostnameVerifier(hostnameVerifier: HostnameVerifier): Interceptor.Chain = this
++        override fun withCertificatePinner(certificatePinner: CertificatePinner): Interceptor.Chain = this
++        override fun withConnectionPool(connectionPool: ConnectionPool): Interceptor.Chain = this
+     }
+ 
+     private object StubConnection : Connection {
+diff --git a/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt b/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt
+index 47d6236e4073dbf50bdd126d37fca9a5eac75480..4d6ed58658ca57ec6ebe5658692de7fd25479326 100644
+--- a/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt
++++ b/server/src/test/kotlin/suwayomi/tachidesk/manga/impl/builtin/komga/BuiltInKomgaLifecycleTest.kt
+@@ -35,15 +35,22 @@ class BuiltInKomgaLifecycleTest : ApplicationTest() {
+     private val first = 4508733312114627536L
+     private val second = 8074481155021144106L
+     private val third = 5132811728275817394L
++    private val forcedInitializationFailureProperty =
++        "suwayomi.tachidesk.gomanga.failBuiltInKomgaLifecycleInit"
+ 
+     @BeforeEach
+     fun resetBeforeTest() {
++        System.clearProperty(forcedInitializationFailureProperty)
+         BuiltInKomgaLifecycle.initialize()
+         BuiltInKomgaLifecycle.allowedSourceIds.forEach(BuiltInKomgaLifecycle::deactivate)
+     }
+ 
+     @AfterEach
+     fun resetAfterTest() {
++        System.clearProperty(forcedInitializationFailureProperty)
++        if (!BuiltInKomgaLifecycle.isInitialized) {
++            BuiltInKomgaLifecycle.initialize()
++        }
+         BuiltInKomgaLifecycle.allowedSourceIds.forEach(BuiltInKomgaLifecycle::deactivate)
+     }
+ 
+@@ -89,18 +96,47 @@ class BuiltInKomgaLifecycleTest : ApplicationTest() {
+     }
+ 
+     @Test
+-    fun `initialize after cache loss restores only persisted active rows`() {
++    fun `restart restores zero active Komga slots`() {
++        assertRestartRestores()
++    }
++
++    @Test
++    fun `restart restores exactly one active Komga slot`() {
++        assertRestartRestores(second)
++    }
++
++    @Test
++    fun `restart restores exactly two active Komga slots`() {
++        assertRestartRestores(first, third)
++    }
++
++    @Test
++    fun `restart restores exactly three active Komga slots`() {
++        assertRestartRestores(first, second, third)
++    }
++
++    @Test
++    fun `forced lifecycle initialization failure is surfaced and recoverable`() {
+         BuiltInKomgaLifecycle.activate(first)
+-        BuiltInKomgaLifecycle.activate(third)
+         GetSource.unregisterAllSources()
+ 
+-        assertNull(GetSource.getSourceOrNull(second))
++        System.setProperty(forcedInitializationFailureProperty, "true")
++        val failure =
++            assertFailsWith<BuiltInKomgaLifecycleUnavailable> {
++                BuiltInKomgaLifecycle.initialize()
++            }
++
++        assertEquals("built-in Komga factory failed to initialize", failure.message)
++        assertFalse(BuiltInKomgaLifecycle.isInitialized)
++        assertFailsWith<BuiltInKomgaLifecycleUnavailable> {
++            BuiltInKomgaLifecycle.activeSourceIds()
++        }
++
++        System.clearProperty(forcedInitializationFailureProperty)
+         BuiltInKomgaLifecycle.initialize()
+ 
+-        assertEquals(listOf(first, third), BuiltInKomgaLifecycle.activeSourceIds())
++        assertEquals(listOf(first), BuiltInKomgaLifecycle.activeSourceIds())
+         assertNotNull(GetSource.getSourceOrNull(first))
+-        assertNull(GetSource.getSourceOrNull(second))
+-        assertNotNull(GetSource.getSourceOrNull(third))
+     }
+ 
+     @Test
+@@ -117,4 +153,20 @@ class BuiltInKomgaLifecycleTest : ApplicationTest() {
+         }
+         assertEquals(listOf(first), BuiltInKomgaLifecycle.activeSourceIds())
+     }
++
++    private fun assertRestartRestores(vararg expectedSourceIds: Long) {
++        expectedSourceIds.forEach(BuiltInKomgaLifecycle::activate)
++        GetSource.unregisterAllSources()
++
++        BuiltInKomgaLifecycle.initialize()
++
++        assertEquals(expectedSourceIds.toList(), BuiltInKomgaLifecycle.activeSourceIds())
++        BuiltInKomgaLifecycle.allowedSourceIds.forEach { sourceId ->
++            if (sourceId in expectedSourceIds) {
++                assertNotNull(GetSource.getSourceOrNull(sourceId))
++            } else {
++                assertNull(GetSource.getSourceOrNull(sourceId))
++            }
++        }
++    }
+ }

@@ -1,0 +1,3591 @@
+diff --git a/server/src/main/java/com/googlecode/dex2jar/ir/ts/NewTransformer.java b/server/src/main/java/com/googlecode/dex2jar/ir/ts/NewTransformer.java
+new file mode 100644
+index 00000000..06f6bc38
+--- /dev/null
++++ b/server/src/main/java/com/googlecode/dex2jar/ir/ts/NewTransformer.java
+@@ -0,0 +1,414 @@
++package com.googlecode.dex2jar.ir.ts;
++
++import com.googlecode.dex2jar.ir.ET;
++import com.googlecode.dex2jar.ir.IrMethod;
++import com.googlecode.dex2jar.ir.StmtTraveler;
++import com.googlecode.dex2jar.ir.expr.Exprs;
++import com.googlecode.dex2jar.ir.expr.InvokeExpr;
++import com.googlecode.dex2jar.ir.expr.Local;
++import com.googlecode.dex2jar.ir.expr.NewExpr;
++import com.googlecode.dex2jar.ir.expr.Value;
++import com.googlecode.dex2jar.ir.stmt.AssignStmt;
++import com.googlecode.dex2jar.ir.stmt.LabelStmt;
++import com.googlecode.dex2jar.ir.stmt.Stmt;
++import com.googlecode.dex2jar.ir.stmt.Stmts;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static com.googlecode.dex2jar.ir.expr.Value.VT.INVOKE_SPECIAL;
++import static com.googlecode.dex2jar.ir.expr.Value.VT.LOCAL;
++import static com.googlecode.dex2jar.ir.expr.Value.VT.NEW;
++import static com.googlecode.dex2jar.ir.stmt.Stmt.ST.ASSIGN;
++import static com.googlecode.dex2jar.ir.stmt.Stmt.ST.LABEL;
++import static com.googlecode.dex2jar.ir.stmt.Stmt.ST.VOID_INVOKE;
++
++/**
++ * simply merge
++ * <p>
++ * <pre>
++ *     a=NEW Labc;
++ *     a.&lt;init&gt;();
++ * </pre>
++ * <p>
++ * to
++ * <p>
++ * <pre>
++ * a = new abc();
++ * </pre>
++ * <p>
++ * Run after [SSATransformer, RemoveLocalFromSSA]
++ */
++public class NewTransformer implements Transformer {
++
++    static final Vx IGNORED = new Vx(null, true);
++
++    @Override
++    public void transform(IrMethod method) {
++
++        // 1. replace
++        // =========
++        // a=NEW Abc;
++        // b=a
++        // b.<init>()
++        // to ======
++        // a=new Abc();
++        // b=a;
++        // =========
++        replaceX(method);
++
++        // 2. replace NEW Abc;.<init>() -> new Abc();
++        replaceAST(method);
++
++    }
++
++    void replaceX(IrMethod method) {
++        final Map<Local, TObject> init = new HashMap<>();
++        for (Stmt p : method.stmts) {
++            if (p.st == ASSIGN && p.getOp1().vt == LOCAL && p.getOp2().vt == NEW) {
++                // the stmt is a new assign stmt
++                Local local = (Local) p.getOp1();
++                init.put(local, new TObject(local, (AssignStmt) p));
++            }
++        }
++
++        if (!init.isEmpty()) {
++            final int size = Cfg.reIndexLocal(method);
++            makeSureUsedBeforeConstructor(method, init, size);
++            if (!init.isEmpty()) {
++                replace0(method, init, size);
++            }
++            for (Stmt stmt : method.stmts) {
++                stmt.frame = null;
++            }
++        }
++    }
++
++    void replaceAST(IrMethod method) {
++        Iterator<Stmt> it = method.stmts.iterator();
++        while (it.hasNext()) {
++            Stmt p = it.next();
++
++            InvokeExpr ie = findInvokeExpr(p);
++
++            if (ie != null) {
++                if ("<init>".equals(ie.getName()) && "V".equals(ie.getRet())) {
++                    Value[] orgOps = ie.getOps();
++                    if (orgOps[0].vt == NEW) {
++                        NewExpr newExpr = (NewExpr) ie.getOps()[0];
++                        if (newExpr != null) {
++                            Value[] nOps = Arrays.copyOfRange(orgOps, 1, orgOps.length);
++                            InvokeExpr invokeNew = Exprs.nInvokeNew(nOps, ie.getArgs(), newExpr.type);
++                            method.stmts.insertBefore(p, Stmts.nVoidInvoke(invokeNew));
++                            it.remove();
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    void replace0(IrMethod method, Map<Local, TObject> init, int size) {
++        Set<Local> toDelete = new HashSet<>();
++
++        Local[] locals = new Local[size];
++        for (Local local : method.locals) {
++            locals[local.lsIndex] = local;
++        }
++
++        // find all locals to delete
++        for (TObject obj : init.values()) {
++            Vx[] frame = (Vx[]) obj.invokeStmt.frame;
++            for (int i = 0; i < frame.length; i++) {
++                Vx s = frame[i];
++                if (s != null && s.obj == obj) {
++                    toDelete.add(locals[i]);
++                }
++            }
++        }
++        // delete the locals
++        Iterator<Stmt> it = method.stmts.iterator();
++        while (it.hasNext()) {
++            Stmt p = it.next();
++            if (p.st == ASSIGN && p.getOp1().vt == LOCAL) {
++                if (toDelete.contains((Local) p.getOp1())) {
++                    it.remove();
++                }
++            }
++        }
++        // add the locals back
++        for (TObject obj : init.values()) {
++            Vx[] frame = (Vx[]) obj.invokeStmt.frame;
++            for (int i = 0; i < frame.length; i++) {
++                Vx s = frame[i];
++                if (s != null && s.obj == obj) {
++                    Local b = locals[i];
++                    if (b != obj.local) {
++                        method.stmts.insertAfter(obj.invokeStmt, Stmts.nAssign(b, obj.local));
++                    }
++                }
++            }
++            InvokeExpr ie = findInvokeExpr(obj.invokeStmt);
++            Value[] orgOps = ie.getOps();
++            Value[] nOps = Arrays.copyOfRange(orgOps, 1, orgOps.length);
++            // GoManga fix: the real allocation type lives in obj.init — the original
++            // `local = NEW T;` assignment — NOT in the <init> invoke's owner. In the
++            // separate-statement form (`a = NEW T; b = a; b.<init>()`) orgOps[0] is the
++            // LOCAL receiver, so the upstream `ie.getOwner()` collapses `new T` to the
++            // <init> owner. When R8 inlines an obfuscated subclass T's constructor, DEX
++            // keeps `new-instance T` but rewrites the invoke to the SUPER's <init>, so
++            // getOwner() yields the super (often java/lang/Object). That bytecode still
++            // VERIFIES where an interface argument is expected (JVMS interface-arg
++            // leniency) but ClassCastExceptions at run time (RealInterceptorChain casting
++            // a bare Object to okhttp3.Interceptor). Read T from the NEW expr instead.
++            Value initRhs = (obj.init != null) ? obj.init.getOp2() : null;
++            String newType = (initRhs != null && initRhs.vt == NEW)
++                    ? ((com.googlecode.dex2jar.ir.expr.NewExpr) initRhs).type
++                    : ie.getOwner();
++            InvokeExpr invokeNew = Exprs.nInvokeNew(nOps, ie.getArgs(), newType);
++            method.stmts.replace(obj.invokeStmt, Stmts.nAssign(obj.local, invokeNew));
++        }
++    }
++
++    void makeSureUsedBeforeConstructor(IrMethod method, final Map<Local, TObject> init, final int size) {
++        Cfg.createCFG(method);
++        Cfg.dfs(method.stmts, new Cfg.FrameVisitor<Vx[]>() {
++
++            boolean keepFrame = false;
++            final Vx[] tmp = new Vx[size];
++            final StmtTraveler stmtTraveler = new StmtTraveler() {
++                Stmt current;
++
++                @Override
++                public Stmt travel(Stmt stmt) {
++
++                    this.current = stmt;
++                    if (stmt.et == ET.E2) {
++                        if (stmt.getOp1().vt == LOCAL) {
++                            Local op1 = (Local) stmt.getOp1();
++                            if (stmt.getOp2().vt == LOCAL) {
++                                Local op2 = (Local) stmt.getOp2();
++                                tmp[op1.lsIndex] = tmp[op2.lsIndex];
++                                return stmt;
++                            } else if (stmt.getOp2().vt == NEW) {
++                                tmp[op1.lsIndex] = new Vx(init.get(op1), false);
++                                return stmt;
++                            } else {
++                                travel(stmt.getOp2());
++                                tmp[op1.lsIndex] = IGNORED;
++                                return stmt;
++                            }
++                        }
++                    }
++                    if (stmt.st == LABEL) {
++                        LabelStmt labelStmt = (LabelStmt) stmt;
++                        if (labelStmt.phis != null) {
++                            for (AssignStmt phi : labelStmt.phis) {
++                                Local local = (Local) phi.getOp1();
++                                tmp[local.lsIndex] = IGNORED;
++                            }
++                        }
++                        return stmt;
++                    }
++                    return super.travel(stmt);
++                }
++
++                @Override
++                public Value travel(Value op) {
++                    if (op.vt == INVOKE_SPECIAL) {
++                        if (op.getOps().length >= 1) {
++                            InvokeExpr ie = (InvokeExpr) op;
++                            if ("<init>".equals(ie.getName())) {
++                                Value thiz = op.getOps()[0];
++                                if (thiz.vt == LOCAL) {
++                                    Local local = (Local) thiz;
++                                    Vx vx = tmp[local.lsIndex];
++                                    TObject object = vx.obj;
++                                    if (object != null) {
++                                        if (object.invokeStmt != null) {
++                                            object.useBeforeInit = true;
++                                        } else {
++                                            vx.init = true;
++                                            object.invokeStmt = current;
++                                            for (int i = 0; i < tmp.length; i++) {
++                                                Vx s = tmp[i];
++                                                if (s != null && s.obj == object) {
++                                                    tmp[i] = IGNORED;
++                                                }
++                                            }
++                                            keepFrame = true;
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    op = super.travel(op);
++
++                    if (op.vt == LOCAL) {
++                        use((Local) op);
++                    }
++
++                    return op;
++                }
++            };
++
++            @Override
++            public Vx[] merge(Vx[] srcFrame, Vx[] distFrame, Stmt src, Stmt dist) {
++                if (distFrame == null) {
++                    distFrame = new Vx[size];
++                    System.arraycopy(srcFrame, 0, distFrame, 0, size);
++                } else {
++                    for (int i = 0; i < size; i++) {
++                        Vx s = srcFrame[i];
++                        Vx d = distFrame[i];
++                        if (s != null) {
++                            if (d == null) {
++                                distFrame[i] = s;
++                            } else {
++                                if (s != d) {
++                                    TObject obj = s.obj;
++                                    if (obj != null) {
++                                        obj.useBeforeInit = true;
++                                    }
++                                    obj = d.obj;
++                                    if (obj != null) {
++                                        obj.useBeforeInit = true;
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++
++                if (dist.st == LABEL) {
++                    List<AssignStmt> phis = ((LabelStmt) dist).phis;
++                    if (phis != null && !phis.isEmpty()) {
++                        for (AssignStmt phi : phis) {
++                            for (Value value : phi.getOp2().getOps()) {
++                                Local local = (Local) value;
++                                int i = local.lsIndex;
++                                Vx s = srcFrame[i];
++                                Vx d = distFrame[i];
++                                if (d != null) {
++                                    if (!d.init) {
++                                        TObject obj = d.obj;
++                                        if (obj != null) {
++                                            obj.useBeforeInit = true;
++                                        }
++                                    }
++                                } else if (s != null) {
++                                    if (!s.init) {
++                                        TObject obj = s.obj;
++                                        if (obj != null) {
++                                            obj.useBeforeInit = true;
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++                return distFrame;
++            }
++
++            @Override
++            public Vx[] initFirstFrame(Stmt first) {
++                return new Vx[size];
++            }
++
++            @Override
++            public Vx[] exec(Vx[] frame, Stmt stmt) {
++                keepFrame = false;
++                System.arraycopy(frame, 0, tmp, 0, size);
++                stmtTraveler.travel(stmt);
++                if (stmt.cfgFroms.size() > 1) {
++                    keepFrame = true;
++                }
++
++                if (!keepFrame) {
++                    stmt.frame = null;
++                }
++                return tmp;
++            }
++
++            void use(Local local) {
++                Vx vx = tmp[local.lsIndex];
++                if (!vx.init) {
++                    TObject object = vx.obj;
++                    if (object != null) {
++                        object.useBeforeInit = true;
++                    }
++
++                    tmp[local.lsIndex] = IGNORED;
++                }
++
++            }
++        });
++        Iterator<Map.Entry<Local, TObject>> iterator = init.entrySet().iterator();
++        while (iterator.hasNext()) {
++            Map.Entry<Local, TObject> e = iterator.next();
++            boolean keep = true;
++            TObject obj = e.getValue();
++            if (obj.useBeforeInit) {
++                keep = false;
++            }
++            if (obj.invokeStmt == null) {
++                keep = false;
++            }
++            if (!keep) {
++                iterator.remove();
++            }
++        }
++    }
++
++    InvokeExpr findInvokeExpr(Stmt p) {
++        InvokeExpr ie = null;
++        if (p.st == ASSIGN) {
++            if (p.getOp2().vt == INVOKE_SPECIAL) {
++                ie = (InvokeExpr) p.getOp2();
++            }
++        } else if (p.st == VOID_INVOKE) {
++            Value op = p.getOp();
++            if (op instanceof InvokeExpr) {
++                ie = (InvokeExpr) op;
++            }
++        }
++        return ie;
++    }
++
++    static class TObject {
++
++        public Stmt invokeStmt;
++
++        Local local;
++
++        boolean useBeforeInit;
++
++        final AssignStmt init; // GoManga: package-private so replace0 can read the real NEW type
++
++        TObject(Local local, AssignStmt init) {
++            this.local = local;
++            this.init = init;
++        }
++
++    }
++
++    static class Vx {
++
++        boolean init;
++
++        TObject obj;
++
++        Vx(TObject obj, boolean init) {
++            this.obj = obj;
++            this.init = init;
++        }
++
++    }
++
++}
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+index 0d0fb65b..a9af9f71 100644
+--- a/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/network/NetworkHelper.kt
+@@ -8,6 +8,7 @@ package eu.kanade.tachiyomi.network
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+ import android.content.Context
++import eu.kanade.tachiyomi.network.interceptor.CleartextGuardInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.CloudflareInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UncaughtExceptionInterceptor
+ import eu.kanade.tachiyomi.network.interceptor.UserAgentInterceptor
+@@ -48,15 +49,48 @@ class NetworkHelper(
+     }
+     // Tachidesk <--
+ 
+-    private val userAgent =
+-        MutableStateFlow(
+-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+-        )
++    // GoMangaStableDefaultUA: the stock Suwayomi default is a DESKTOP Chrome UA.
++    // The host pushes a STABLE ecosystem UA (the Tachiyomi/Mihon-family default
++    // the extensions are tested against) over it at boot via setDefaultUserAgent.
++    // Deliberately NOT the device WebKit UA: UA-sensitive source APIs degrade
++    // under a mobile Safari UA (happymh page-list), and Cloudflare clearance/UA
++    // pairing is per CF-walled request (CloudflareInterceptor), never global.
++    private val userAgent = MutableStateFlow(DEFAULT_USER_AGENT)
+     val userAgentFlow = userAgent.asStateFlow()
+ 
+     fun defaultUserAgentProvider(): String = userAgent.value
+ 
++    // GoMangaStableDefaultUA: let the host push ONE canonical source UA at boot
++    // (POST /api/v1/gomanga/default-ua). This is the only writer of the global
++    // default — the CloudflareInterceptor's global adoption is disabled (see the
++    // interceptor wiring below) and the cookie-seed route no longer adopts the
++    // clearance UA, so a CF verify can never flip every source onto a mobile UA.
++    //
++    // Blank + equality guarded: a UA change fires the drop(1) watcher below
++    // (unregisterAllCatalogueSources, rebuilding every cached source). Re-pushing
++    // the same UA (every boot/relaunch seeds it) must be a no-op or it churns
++    // live source instances for nothing. Set once at boot on a cold cache; the
++    // guard makes repeats free.
++    fun setDefaultUserAgent(ua: String) {
++        if (ua.isNotBlank() && ua != userAgent.value) {
++            userAgent.value = ua
++        }
++    }
++
++    // GoMangaInsecureHttpGate: mirror of the app-side InsecureSourcePolicy. The
++    // host pushes the user's opt-in at boot AND on every toggle flip (POST
++    // /api/v1/gomanga/allow-insecure-http). Fail-closed: false until the host
++    // pushes the real value, so a source fetch racing the boot window is blocked
++    // rather than leaking cleartext. Read LIVE per request by
++    // CleartextGuardInterceptor { allowInsecureHttp.value }, so a toggle takes
++    // effect with NO source rebuild — deliberately no drop(1) watcher (unlike
++    // the UA flow, which must reset cached source headers).
++    private val allowInsecureHttp = MutableStateFlow(false)
++
++    fun setAllowInsecureHttp(allowed: Boolean) {
++        allowInsecureHttp.value = allowed
++    }
++
+     init {
+         @OptIn(DelicateCoroutinesApi::class)
+         userAgent
+@@ -68,9 +102,29 @@ class NetworkHelper(
+ 
+     private val baseClientBuilder: OkHttpClient.Builder
+         get() {
++            // GoMangaInsecureHttpGate: ONE instance, registered FIRST in BOTH
++            // the application and network interceptor lists below. Reads the
++            // live policy flow per request (no rebuild on toggle).
++            val cleartextGuard = CleartextGuardInterceptor { allowInsecureHttp.value }
+             val builder =
+                 OkHttpClient
+                     .Builder()
++                    // GoMangaOkHttpConcurrency: bound concurrent source requests
++                    // through the embedded JVM proxy. OkHttp's default is 64/5; a
++                    // prior pass raised this to 128/16 to fill cover grids faster,
++                    // but on the pure-interpreter DEVICE VM that let too many
++                    // full-image heap buffers run at once, degrading the whole JVM
++                    // over a session (local listSources 50ms->4.5s on iPhone 14
++                    // Pro 2026-06-04; reproduced x1.8 on a forced-interpreter sim).
++                    // Cap at 32/8 — aligned with the app's cover request limiter
++                    // (8) so real parallelism is preserved while heap/GC pressure
++                    // is bounded.
++                    .dispatcher(
++                        okhttp3.Dispatcher().apply {
++                            maxRequests = 32
++                            maxRequestsPerHost = 8
++                        },
++                    )
+                     .cookieJar(PersistentCookieJar(cookieStore))
+                     .connectTimeout(30, TimeUnit.SECONDS)
+                     .readTimeout(30, TimeUnit.SECONDS)
+@@ -80,8 +134,20 @@ class NetworkHelper(
+                             directory = Files.createTempDirectory("tachidesk_network_cache").toFile(),
+                             maxSize = 5L * 1024 * 1024, // 5 MiB
+                         ),
+-                    ).addInterceptor(UncaughtExceptionInterceptor())
++                    )
++                    // GoMangaInsecureHttpGate FIRST in the app chain: the
++                    // original-url check precedes UA/Cloudflare/RetryAndFollowUp/
++                    // Connect, so a blocked cleartext request short-circuits to
++                    // 496 before any socket opens.
++                    .addInterceptor(cleartextGuard)
++                    .addInterceptor(UncaughtExceptionInterceptor())
+                     .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
++                    // GoMangaInsecureHttpGate FIRST in the network chain too, so a
++                    // redirect-downgraded (https->http) hop is refused before the
++                    // logging network interceptor touches it. (v2.3 dropped the
++                    // stock IgnoreGzip/Brotli network interceptors, so the guard is
++                    // now the first — and only preceding — network interceptor.)
++                    .addNetworkInterceptor(cleartextGuard)
+ 
+             // if (preferences.verboseLogging().get()) {
+             val httpLoggingInterceptor =
+@@ -99,8 +165,15 @@ class NetworkHelper(
+             builder.addNetworkInterceptor(httpLoggingInterceptor)
+             // }
+ 
++            // GoMangaStableDefaultUA: a CF solve must NOT adopt the clearance UA
++            // as the server-wide default. The clearance UA is the host device's
++            // WebKit UA, and UA-sensitive source APIs degrade under it for every
++            // unrelated request (happymh page-list). The CloudflareInterceptor
++            // already forces the clearance UA + cookies onto each CF-walled
++            // request itself; the global default stays whatever the host pushed
++            // via /api/v1/gomanga/default-ua.
+             builder.addInterceptor(
+-                CloudflareInterceptor(setUserAgent = { userAgent.value = it }),
++                CloudflareInterceptor(setUserAgent = { _ -> }),
+             )
+ 
+             // when (preferences.dohProvider().get()) {
+@@ -127,4 +200,13 @@ class NetworkHelper(
+     @Deprecated("The regular client handles Cloudflare by default")
+     @Suppress("UNUSED")
+     val cloudflareClient by lazy { client }
++
++    companion object {
++        // GoMangaStableDefaultUA: the stock desktop-Chrome default, used until
++        // the host pushes the ecosystem UA at boot. Still a content-safe UA for
++        // UA-sensitive sources if that push never arrives.
++        const val DEFAULT_USER_AGENT =
++            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
++                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
++    }
+ }
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/network/PersistentCookieStore.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/network/PersistentCookieStore.kt
+index f2da3cd5..7d0fae73 100644
+--- a/server/src/main/kotlin/eu/kanade/tachiyomi/network/PersistentCookieStore.kt
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/network/PersistentCookieStore.kt
+@@ -77,6 +77,91 @@ class PersistentCookieStore(
+         }
+     }
+ 
++    fun removeHost(host: String): Boolean =
++        lock.withLock {
++            val normalizedHost = normalizeHost(host)
++            if (normalizedHost.isBlank()) return@withLock false
++            val domainsToRemove = cookieMap.keys.filter { cookieDomainOverlaps(it, normalizedHost) }.toSet()
++            if (domainsToRemove.isEmpty()) return@withLock false
++            domainsToRemove.forEach { cookieMap.remove(it) }
++            saveToDisk(domainsToRemove)
++            true
++        }
++
++    fun removeNamedForHost(
++        host: String,
++        names: Set<String>,
++    ): Boolean =
++        lock.withLock {
++            val normalizedHost = normalizeHost(host)
++            val lowerNames = names.map { it.lowercase() }.toSet()
++            if (normalizedHost.isBlank() || lowerNames.isEmpty()) return@withLock false
++            val domainsToSave = mutableSetOf<String>()
++            cookieMap.keys
++                .filter { cookieDomainOverlaps(it, normalizedHost) }
++                .toList()
++                .forEach { domain ->
++                    val current = cookieMap[domain].orEmpty()
++                    val kept = current.filter { it.name.lowercase() !in lowerNames }
++                    if (kept.size != current.size) {
++                        domainsToSave.add(domain)
++                        if (kept.isEmpty()) {
++                            cookieMap.remove(domain)
++                        } else {
++                            cookieMap[domain] = kept
++                        }
++                    }
++                }
++            if (domainsToSave.isEmpty()) return@withLock false
++            saveToDisk(domainsToSave)
++            true
++        }
++
++    fun replaceNamedForHost(
++        host: String,
++        names: Set<String>,
++        cookies: List<Cookie>,
++    ) {
++        lock.withLock {
++            val normalizedHost = normalizeHost(host)
++            val lowerNames = names.map { it.lowercase() }.toSet()
++            val domainsToSave = mutableSetOf<String>()
++            if (normalizedHost.isNotBlank() && lowerNames.isNotEmpty()) {
++                cookieMap.keys
++                    .filter { cookieDomainOverlaps(it, normalizedHost) }
++                    .toList()
++                    .forEach { domain ->
++                        val current = cookieMap[domain].orEmpty()
++                        val kept = current.filter { it.name.lowercase() !in lowerNames }
++                        if (kept.size != current.size) {
++                            domainsToSave.add(domain)
++                            if (kept.isEmpty()) {
++                                cookieMap.remove(domain)
++                            } else {
++                                cookieMap[domain] = kept
++                            }
++                        }
++                    }
++            }
++
++            for (cookie in cookies) {
++                val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
++                val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name }
++                if (pos == -1) {
++                    cookiesForDomain.add(cookie)
++                } else {
++                    cookiesForDomain[pos] = cookie
++                }
++                cookieMap[cookie.domain] = cookiesForDomain
++                domainsToSave.add(cookie.domain)
++            }
++
++            if (domainsToSave.isNotEmpty()) {
++                saveToDisk(domainsToSave)
++            }
++        }
++    }
++
+     override fun removeAll(): Boolean =
+         lock.withLock {
+             val wasNotEmpty = cookieMap.isEmpty()
+@@ -194,6 +279,20 @@ class PersistentCookieStore(
+             }.apply()
+     }
+ 
++    private fun normalizeHost(host: String): String =
++        host.trim().lowercase().removePrefix(".").removeSuffix(".")
++
++    private fun cookieDomainOverlaps(
++        domain: String,
++        host: String,
++    ): Boolean {
++        val normalizedDomain = normalizeHost(domain)
++        return normalizedDomain.isNotBlank() &&
++            (normalizedDomain == host ||
++                normalizedDomain.endsWith(".$host") ||
++                host.endsWith(".$normalizedDomain"))
++    }
++
+     private fun Cookie.hasExpired() = System.currentTimeMillis() >= expiresAt
+ 
+     private fun HttpCookie.toCookie(urlDomain: String?): Cookie? {
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptor.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptor.kt
+new file mode 100644
+index 00000000..3eb2041a
+--- /dev/null
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptor.kt
+@@ -0,0 +1,97 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import okhttp3.HttpUrl
++import okhttp3.Interceptor
++import okhttp3.Protocol
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import java.io.IOException
++
++/**
++ * GoMangaInsecureHttpGate: blocks non-loopback cleartext http egress from the
++ * source-fetch OkHttp client when the app-side InsecureSourcePolicy
++ * ("允許不安全的來源") is OFF. This is the JVM-internal half of that policy —
++ * it closes the residuals the app's URLSession gate can never see because the
++ * request originates and terminates inside the embedded server's OkHttp:
++ *   1. a requiresProxy page image the JVM fetches itself (no app-direct URL),
++ *   2. an https->http redirect downgrade OkHttp follows internally,
++ *   3. an https source's extension calling an http endpoint directly.
++ *
++ * Register the SAME instance BOTH as an application interceptor
++ * (addInterceptor) AND a network interceptor (addNetworkInterceptor). The two
++ * invocations are told apart by chain.connection():
++ *   - application invocation (connection() == null): sees the ORIGINAL request
++ *     url before any socket is opened -> synthesize a 496 short-circuit, no
++ *     connection. Catches residuals #1 / #3 cleanly (nothing dials out).
++ *   - network invocation (connection() != null): fires once per redirect/retry
++ *     hop with the ACTUAL hop url -> MUST throw (a network interceptor that
++ *     returns a synthetic response trips OkHttp's "network interceptor must
++ *     call proceed() exactly once"). Catches residual #2, the downgraded hop.
++ *
++ * When the policy is ON, isAllowed() is true for every url on both invocations
++ * -> chain.proceed(request) unconditionally, i.e. a PURE no-op (no synthetic
++ * response, no throw, zero behavior change for a working http source).
++ *
++ * The loopback exemption is kept byte-identical to the app-side
++ * InsecureSourcePolicy.isLoopbackHost and CloudflareInterceptor's own loopback
++ * check so the embedded server's own 127.0.0.1 traffic and the in-app
++ * FlareSolverr/CF WebView proxy (localhost) are never gated.
++ */
++class CleartextGuardInterceptor(
++    private val allowInsecureHttp: () -> Boolean,
++) : Interceptor {
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        if (isAllowed(request.url)) {
++            return chain.proceed(request)
++        }
++        return if (chain.connection() == null) {
++            // Application invocation: no socket yet -> short-circuit.
++            blockedResponse(request)
++        } else {
++            // Network invocation (incl. a redirect-downgraded hop): a synthetic
++            // response is illegal here, so refuse the hop by throwing.
++            throw IOException(
++                "$GATE_MARKER blocked cleartext http to ${request.url.host}",
++            )
++        }
++    }
++
++    private fun isAllowed(url: HttpUrl): Boolean =
++        url.isHttps || isLoopbackHost(url.host) || allowInsecureHttp()
++
++    private fun isLoopbackHost(host: String): Boolean =
++        when (host.lowercase()) {
++            "127.0.0.1", "localhost", "::1" -> true
++            else -> false
++        }
++
++    private fun blockedResponse(request: Request): Response =
++        Response.Builder()
++            .request(request)
++            .protocol(Protocol.HTTP_1_1)
++            .code(INSECURE_BLOCKED_CODE)
++            .message("Insecure cleartext blocked")
++            .header("X-GoManga-Insecure-Blocked", "1")
++            // Carry the marker in the BODY, not just an empty 496. Sources that swallow
++            // a failed request into a decode/parse error (e.g. manhuaren's fetchToken →
++            // Json.decodeFromString(body) → "JSON input: <body>") then propagate the
++            // marker verbatim, so the app-side SourceErrorPresentation classifier can
++            // still recognise it as an insecure-cleartext block and offer the
++            // 允許不安全來源 CTA — instead of an opaque EOF the user can't act on.
++            .body("$GATE_MARKER blocked cleartext http to ${request.url.host}".toResponseBody(null))
++            .build()
++
++    companion object {
++        /** Non-standard status used for a policy-blocked cleartext request. */
++        const val INSECURE_BLOCKED_CODE = 496
++
++        /**
++         * Build marker greppable in source AND in the shipped bytecode strings,
++         * wired into 20b-build-suwayomi-from-source.sh so a silently-non-landing
++         * change fails the build instead of shipping stale bytecode.
++         */
++        const val GATE_MARKER = "GoMangaInsecureHttpGate"
++    }
++}
+diff --git a/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CloudflareInterceptor.kt b/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CloudflareInterceptor.kt
+index c19ee0f3..34b4186b 100644
+--- a/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CloudflareInterceptor.kt
++++ b/server/src/main/kotlin/eu/kanade/tachiyomi/network/interceptor/CloudflareInterceptor.kt
+@@ -20,6 +20,8 @@ import okhttp3.FormBody
+ import okhttp3.HttpUrl
+ import okhttp3.Interceptor
+ import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.MediaType.Companion.toMediaTypeOrNull
++import okhttp3.Protocol
+ import okhttp3.Request
+ import okhttp3.RequestBody.Companion.toRequestBody
+ import okhttp3.Response
+@@ -54,7 +56,14 @@ class CloudflareInterceptor(
+ 
+         logger.debug { "Cloudflare anti-bot is on, CloudflareInterceptor is kicking in..." }
+ 
+-        return try {
++        // GoMangaConvergeFirst: try the FlareSolverr/shim path FIRST. It adopts the
++        // cf_clearance cookies + the clearance UA into the server's OWN OkHttp jar
++        // (cookieStore.addAll + setUserAgent) and retries the request DIRECTLY — so
++        // once a host is solved, subsequent requests in the session go direct instead
++        // of paying the WebView-proxy double-hop on every call. The WebView proxy stays
++        // as the LAST resort below.
++        val originalCode = originalResponse.code
++        try {
+             originalResponse.close()
+             // network.cookieStore.remove(originalRequest.url.toUri())
+ 
+@@ -92,12 +101,43 @@ class CloudflareInterceptor(
+             val request =
+                 CFClearance.requestWithFlareSolverr(flareResponse, setUserAgent, originalRequest)
+ 
+-            chain.proceed(request)
++            val retried = chain.proceed(request)
++            // If the direct retry (now carrying the adopted cf_clearance + UA) is NO
++            // LONGER a Cloudflare wall, convergence worked — return it and the host
++            // stays on the cheap direct path for the rest of the session. BUT some
++            // sources (e.g. happymh) gate behind a browser-TLS / path-scoped challenge
++            // that the JVM OkHttp client canNOT pass even WITH a valid clearance cookie
++            // + UA — the direct retry stays 403/Cloudflare. In that case do NOT return
++            // the 403; fall through to the WebView proxy (Safari TLS + same-origin
++            // context), which is the ONLY path that clears those sources.
++            val stillWalled =
++                retried.code in ERROR_CODES && retried.header("Server") in SERVER_CHECK
++            if (!stillWalled) {
++                return retried
++            }
++            logger.debug { "Direct adoption still walled (code=${retried.code}); falling back to the WebView proxy" }
++            retried.close()
+         } catch (e: Exception) {
+-            // Because OkHttp's enqueue only handles IOExceptions, wrap the exception so that
+-            // we don't crash the entire app
+-            throw IOException(e)
++            // The shim has no clearance for this host yet, or the bypass failed
++            // (CloudflareBypassException / transport). Do NOT propagate — fall through
++            // to the WebView proxy, which can solve the challenge interactively and
++            // flag the host for user verification.
++            logger.debug(e) { "Direct adoption failed; falling back to the WebView proxy" }
++        }
++
++        // WebView proxy fallback — the LAST resort. Reached when direct adoption failed
++        // or — crucially — succeeded at adopting cookies but the source STILL walls the
++        // JVM client (browser-TLS-gated sources like happymh). This is the only path
++        // those sources clear.
++        runBlocking {
++            CFClearance.resolveWithGoMangaProxy(originalRequest, originalCode)
++        }?.let { proxyResponse ->
++            return proxyResponse
+         }
++
++        // A Cloudflare wall that neither direct adoption nor the proxy could clear.
++        // OkHttp's enqueue only handles IOExceptions, so surface one (don't crash).
++        throw IOException("Cloudflare challenge could not be resolved")
+     }
+ 
+     companion object {
+@@ -185,6 +225,72 @@ object CFClearance {
+         val version: String,
+     )
+ 
++    @Serializable
++    data class GoMangaProxyRequest(
++        val method: String,
++        val url: String,
++        val headers: Map<String, String>,
++        val body: String? = null,
++    )
++
++    @Serializable
++    data class GoMangaProxyResponse(
++        val status: Int,
++        val headers: Map<String, String>,
++        val body: String,
++    )
++
++    suspend fun resolveWithGoMangaProxy(
++        originalRequest: Request,
++        responseCode: Int,
++    ): Response? {
++        if (!shouldAttemptGoMangaProxy(originalRequest, responseCode)) {
++            return null
++        }
++
++        val requestBody = originalRequest.textBodyOrNull()
++        if (originalRequest.body != null && requestBody == null) {
++            return null
++        }
++
++        val proxyUrl = serverConfig.flareSolverrUrl.value.removeSuffix("/") + "/gomanga-proxy"
++        val proxyResponse =
++            try {
++                with(json) {
++                    client.value
++                        .newCall(
++                            POST(
++                                url = proxyUrl,
++                                body =
++                                    Json
++                                        .encodeToString(
++                                            GoMangaProxyRequest(
++                                                method = originalRequest.method,
++                                                url = originalRequest.url.toString(),
++                                                headers = originalRequest.headers.asMap(),
++                                                body = requestBody,
++                                            ),
++                                        ).toRequestBody(jsonMediaType),
++                            ),
++                        ).awaitSuccess()
++                        .parseAs<GoMangaProxyResponse>()
++                }
++            } catch (e: Exception) {
++                logger.debug(e) { "GoManga WebView proxy fallback failed for ${originalRequest.url}" }
++                return null
++            }
++
++        if (proxyResponse.status !in 200..399) {
++            logger.debug {
++                "GoManga WebView proxy returned ${proxyResponse.status} for ${originalRequest.url}; keeping original response"
++            }
++            return null
++        }
++
++        logger.debug { "GoManga WebView proxy served ${originalRequest.method} ${originalRequest.url}" }
++        return proxyResponse.toOkHttpResponse(originalRequest)
++    }
++
+     suspend fun resolveWithFlareSolver(
+         originalRequest: Request,
+         onlyCookies: Boolean,
+@@ -293,5 +399,91 @@ object CFClearance {
+         }
+     }
+ 
++    private fun shouldAttemptGoMangaProxy(
++        request: Request,
++        responseCode: Int,
++    ): Boolean {
++        if (!serverConfig.flareSolverrEnabled.value) {
++            return false
++        }
++
++        if (responseCode !in listOf(400, 403, 429, 503)) {
++            return false
++        }
++
++        if (request.method !in listOf("GET", "POST")) {
++            return false
++        }
++
++        val host = request.url.host.lowercase()
++        if (host == "127.0.0.1" || host == "localhost" || host == "::1") {
++            return false
++        }
++
++        val accept = request.header("Accept")?.lowercase().orEmpty()
++        if (accept.contains("image/") || accept.contains("video/")) {
++            return false
++        }
++
++        val bodyType = request.body?.contentType()
++        if (bodyType != null && !bodyType.isTextLike()) {
++            return false
++        }
++
++        return true
++    }
++
++    private fun Request.textBodyOrNull(): String? {
++        val requestBody = body ?: return null
++        val type = requestBody.contentType()
++        if (type != null && !type.isTextLike()) {
++            return null
++        }
++
++        val buffer = Buffer()
++        requestBody.writeTo(buffer)
++        return buffer.readUtf8()
++    }
++
++    private fun okhttp3.MediaType.isTextLike(): Boolean {
++        val major = type.lowercase()
++        val subtype = subtype.lowercase()
++        return major == "text" ||
++            subtype.contains("json") ||
++            subtype.contains("xml") ||
++            subtype.contains("form")
++    }
++
++    private fun okhttp3.Headers.asMap(): Map<String, String> =
++        names().associateWith { name -> get(name).orEmpty() }
++
++    private fun GoMangaProxyResponse.toOkHttpResponse(originalRequest: Request): Response {
++        val contentType =
++            headers.entries
++                .firstOrNull { (name, _) -> name.equals("content-type", ignoreCase = true) }
++                ?.value
++                ?: "text/plain; charset=utf-8"
++        val responseBuilder =
++            Response
++                .Builder()
++                .request(originalRequest)
++                .protocol(Protocol.HTTP_1_1)
++                .code(status)
++                .message("GoManga WebView proxy")
++                .body(body.toResponseBody(contentType.toMediaTypeOrNull()))
++
++        headers.forEach { (name, value) ->
++            if (!name.equals("content-length", ignoreCase = true)) {
++                try {
++                    responseBuilder.header(name, value)
++                } catch (_: IllegalArgumentException) {
++                    logger.debug { "Skipping invalid proxied response header: $name" }
++                }
++            }
++        }
++
++        return responseBuilder.build()
++    }
++
+     private class CloudflareBypassException : Exception()
+ }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/graphql/controller/GraphQLController.kt b/server/src/main/kotlin/suwayomi/tachidesk/graphql/controller/GraphQLController.kt
+index 701d90c1..97d40d26 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/graphql/controller/GraphQLController.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/graphql/controller/GraphQLController.kt
+@@ -17,7 +17,15 @@ import suwayomi.tachidesk.server.JavalinSetup.future
+ import kotlin.io.path.inputStream
+ 
+ object GraphQLController {
+-    private val server = TachideskGraphQLServer.create()
++    // GoManga slim-mode: build the GraphQL schema lazily, on the first GraphQL
++    // request, instead of eagerly during Javalin route registration. The schema
++    // build is a heavy graphql-kotlin reflection pass (~4s on the iOS
++    // pure-interpreter OpenJ9 JVM) and is NOT required by the REST readiness
++    // endpoint (/api/v1/settings/about), so deferring it lets the embedded server
++    // answer REST ~4s sooner on cold start. The first GraphQL query pays the
++    // one-time build cost (the host can hide it by issuing a warm-up query off the
++    // critical path). SYNCHRONIZED lazy => safe under concurrent first requests.
++    private val server by lazy { TachideskGraphQLServer.create() }
+ 
+     /** execute graphql query */
+     fun execute(ctx: Context) {
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+index 2da3c374..40af6e9d 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/MangaAPI.kt
+@@ -26,6 +26,11 @@ import suwayomi.tachidesk.manga.controller.UpdateController
+ 
+ object MangaAPI {
+     fun defineEndpoints() {
++        if (System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true") {
++            defineGoMangaEndpoints()
++            return
++        }
++
+         path("extension") {
+             get("list", ExtensionController.list)
+ 
+@@ -78,6 +83,7 @@ object MangaAPI {
+ 
+             patch("{mangaId}/chapter/{chapterIndex}/meta", MangaController.chapterMeta)
+ 
++            get("{mangaId}/chapter/{chapterIndex}/pages", MangaController.pageResourceList)
+             get("{mangaId}/chapter/{chapterIndex}/page/{index}", MangaController.pageRetrieve)
+         }
+ 
+@@ -147,4 +153,54 @@ object MangaAPI {
+             get("{trackerId}/thumbnail", TrackController.thumbnail)
+         }
+     }
++
++    private fun defineGoMangaEndpoints() {
++        path("extension") {
++            get("list", ExtensionController.list)
++            post("install", ExtensionController.installFile)
++            get("uninstall/{pkgName}", ExtensionController.uninstall)
++            get("icon/{apkName}", ExtensionController.icon)
++        }
++
++        path("source") {
++            get("list", SourceController.list)
++            get("{sourceId}", SourceController.retrieve)
++            get("{sourceId}/popular/{pageNum}", SourceController.popular)
++            get("{sourceId}/latest/{pageNum}", SourceController.latest)
++            get("{sourceId}/preferences", SourceController.getPreferences)
++            post("{sourceId}/preferences", SourceController.setPreference)
++            get("{sourceId}/filters", SourceController.getFilters)
++            post("{sourceId}/filters", SourceController.setFilters)
++            get("{sourceId}/search", SourceController.searchSingle)
++            post("{sourceId}/quick-search", SourceController.quickSearchSingle)
++            // GoManga no-DB source-URL addressing (source-token-addressing):
++            // detail / chapter-list / page-list by the REAL source URL, no H2.
++            get("{sourceId}/manga/details", MangaController.mangaDetailByUrl)
++            get("{sourceId}/manga/chapters", MangaController.chapterListByUrl)
++            get("{sourceId}/manga/chapter/pages", MangaController.pageResourceListByUrl)
++            get("{sourceId}/manga/chapter/page-image", MangaController.pageImageByUrl)
++        }
++
++        path("manga") {
++            get("{mangaId}", MangaController.retrieve)
++            get("{mangaId}/full", MangaController.retrieveFull)
++            get("{mangaId}/thumbnail", MangaController.thumbnail)
++            get("{mangaId}/chapters", MangaController.chapterList)
++            get("{mangaId}/chapter/{chapterIndex}", MangaController.chapterRetrieve)
++            get("{mangaId}/chapter/{chapterIndex}/pages", MangaController.pageResourceList)
++            get("{mangaId}/chapter/{chapterIndex}/page/{index}", MangaController.pageRetrieve)
++        }
++
++        path("gomanga") {
++            // host-owned-cookie-routing 4.1: proactive host->server cookie seed.
++            post("cf-cookies", MangaController.cfCookieSeed)
++            // GoMangaStableDefaultUA: set the server's stable ecosystem source
++            // UA at boot (clearance/UA pairing is per-request, never global).
++            post("default-ua", MangaController.gomangaDefaultUa)
++            // GoMangaInsecureHttpGate: mirror the app-side InsecureSourcePolicy
++            // ("允許不安全的來源") onto the server's OkHttp egress. Pushed at boot
++            // and on toggle flip; fail-closed until pushed.
++            post("allow-insecure-http", MangaController.gomangaAllowInsecureHttp)
++        }
++    }
+ }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+index d82c97ed..1ef8122a 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/controller/MangaController.kt
+@@ -7,12 +7,26 @@ package suwayomi.tachidesk.manga.controller
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
++import eu.kanade.tachiyomi.network.NetworkHelper
++import eu.kanade.tachiyomi.source.model.Page as SourcePage
++import eu.kanade.tachiyomi.source.model.SChapter
++import eu.kanade.tachiyomi.source.model.SManga
++import eu.kanade.tachiyomi.source.online.HttpSource
++import eu.kanade.tachiyomi.util.chapter.ChapterRecognition
++import eu.kanade.tachiyomi.util.chapter.ChapterSanitizer.sanitize
++import io.javalin.http.Context
+ import io.javalin.http.HandlerType
+ import io.javalin.http.HttpStatus
++import io.javalin.http.NotFoundResponse
+ import kotlinx.coroutines.GlobalScope
+ import kotlinx.coroutines.launch
+ import kotlinx.serialization.json.Json
++import okhttp3.Cookie
++import org.jetbrains.exposed.v1.core.ResultRow
++import org.jetbrains.exposed.v1.core.SortOrder
++import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.eq
++import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import org.jetbrains.exposed.v1.jdbc.update
+ import suwayomi.tachidesk.manga.impl.CategoryManga
+@@ -20,13 +34,18 @@ import suwayomi.tachidesk.manga.impl.Chapter
+ import suwayomi.tachidesk.manga.impl.ChapterDownloadHelper
+ import suwayomi.tachidesk.manga.impl.Library
+ import suwayomi.tachidesk.manga.impl.Manga
++import suwayomi.tachidesk.manga.impl.MangaList
+ import suwayomi.tachidesk.manga.impl.Page
+ import suwayomi.tachidesk.manga.impl.chapter.getChapterDownloadReadyByIndex
+ import suwayomi.tachidesk.manga.impl.sync.KoreaderSyncService
++import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
+ import suwayomi.tachidesk.manga.model.dataclass.CategoryDataClass
+ import suwayomi.tachidesk.manga.model.dataclass.ChapterDataClass
+ import suwayomi.tachidesk.manga.model.dataclass.MangaDataClass
++import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
+ import suwayomi.tachidesk.manga.model.table.ChapterTable
++import suwayomi.tachidesk.manga.model.table.MangaStatus
++import suwayomi.tachidesk.manga.model.table.MangaTable
+ import suwayomi.tachidesk.server.JavalinSetup.Attribute
+ import suwayomi.tachidesk.server.JavalinSetup.future
+ import suwayomi.tachidesk.server.JavalinSetup.getAttribute
+@@ -39,10 +58,234 @@ import suwayomi.tachidesk.server.util.pathParam
+ import suwayomi.tachidesk.server.util.queryParam
+ import suwayomi.tachidesk.server.util.withOperation
+ import uy.kohesive.injekt.injectLazy
++import java.io.InputStream
++import java.util.concurrent.ConcurrentHashMap
+ import kotlin.time.Duration.Companion.days
+ 
+ object MangaController {
+     private val json: Json by injectLazy()
++    private val goMangaChapterCache = ConcurrentHashMap<Int, Map<Int, GoMangaChapterDataClass>>()
++
++    data class GoMangaMangaDataClass(
++        val id: Int,
++        val sourceId: String,
++        val url: String,
++        val title: String,
++        val thumbnailUrl: String?,
++        val artist: String?,
++        val author: String?,
++        val description: String?,
++        val genre: List<String>,
++        val status: String,
++        val inLibrary: Boolean,
++        val realUrl: String?,
++        val lastFetchedAt: Long?,
++        val chaptersLastFetchedAt: Long?,
++        val chapterCount: Long?,
++    )
++
++    data class GoMangaChapterDataClass(
++        val id: Int,
++        val url: String,
++        val name: String,
++        val uploadDate: Long,
++        val chapterNumber: Float,
++        val scanlator: String?,
++        val mangaId: Int,
++        val read: Boolean,
++        val bookmarked: Boolean,
++        val lastPageRead: Int,
++        val lastReadAt: Long,
++        val index: Int,
++        val fetchedAt: Long,
++        val realUrl: String?,
++        val downloaded: Boolean,
++        val pageCount: Int,
++        val chapterCount: Int?,
++    )
++
++    private fun slimMode(): Boolean = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++
++    private fun String?.toGoMangaGenreList(): List<String> =
++        this
++            ?.split(",")
++            ?.map { it.trim() }
++            ?.filter { it.isNotEmpty() }
++            .orEmpty()
++
++    private suspend fun getGoMangaManga(
++        mangaId: Int,
++        onlineFetch: Boolean,
++    ): GoMangaMangaDataClass {
++        val initialized =
++            transaction {
++                MangaTable
++                    .selectAll()
++                    .where { MangaTable.id eq mangaId }
++                    .first()[MangaTable.initialized]
++            }
++        if (onlineFetch || !initialized) {
++            Manga.getManga(mangaId, onlineFetch)
++        }
++        return transaction {
++            val row = MangaTable.selectAll().where { MangaTable.id eq mangaId }.first()
++            val chapterCount = ChapterTable.selectAll().where { ChapterTable.manga eq mangaId }.count()
++            GoMangaMangaDataClass(
++                id = mangaId,
++                sourceId = row[MangaTable.sourceReference].toString(),
++                url = row[MangaTable.url],
++                title = row[MangaTable.title],
++                thumbnailUrl = MangaList.proxyThumbnailUrl(mangaId),
++                artist = row[MangaTable.artist],
++                author = row[MangaTable.author],
++                description = row[MangaTable.description],
++                genre = row[MangaTable.genre].toGoMangaGenreList(),
++                status = MangaStatus.valueOf(row[MangaTable.status]).name,
++                inLibrary = row[MangaTable.inLibrary],
++                realUrl = row[MangaTable.realUrl],
++                lastFetchedAt = row[MangaTable.lastFetchedAt],
++                chaptersLastFetchedAt = row[MangaTable.chaptersLastFetchedAt],
++                chapterCount = chapterCount,
++            )
++        }
++    }
++
++    private fun ResultRow.toGoMangaChapter(chapterCount: Int?): GoMangaChapterDataClass =
++        GoMangaChapterDataClass(
++            id = this[ChapterTable.id].value,
++            url = this[ChapterTable.url],
++            name = this[ChapterTable.name],
++            uploadDate = this[ChapterTable.date_upload],
++            chapterNumber = this[ChapterTable.chapter_number],
++            scanlator = this[ChapterTable.scanlator],
++            mangaId = this[ChapterTable.manga].value,
++            read = this[ChapterTable.isRead],
++            bookmarked = this[ChapterTable.isBookmarked],
++            lastPageRead = this[ChapterTable.lastPageRead],
++            lastReadAt = this[ChapterTable.lastReadAt],
++            index = this[ChapterTable.sourceOrder],
++            fetchedAt = this[ChapterTable.fetchedAt],
++            realUrl = this[ChapterTable.realUrl],
++            downloaded = this[ChapterTable.isDownloaded],
++            pageCount = this[ChapterTable.pageCount],
++            chapterCount = chapterCount,
++        )
++
++    private fun ChapterDataClass.toGoMangaChapter(): GoMangaChapterDataClass =
++        GoMangaChapterDataClass(
++            id = id,
++            url = url,
++            name = name,
++            uploadDate = uploadDate,
++            chapterNumber = chapterNumber,
++            scanlator = scanlator,
++            mangaId = mangaId,
++            read = read,
++            bookmarked = bookmarked,
++            lastPageRead = lastPageRead,
++            lastReadAt = lastReadAt,
++            index = index,
++            fetchedAt = fetchedAt,
++            realUrl = realUrl,
++            downloaded = downloaded,
++            pageCount = pageCount,
++            chapterCount = chapterCount,
++        )
++
++    private fun storeGoMangaChapterList(
++        mangaId: Int,
++        chapters: List<GoMangaChapterDataClass>,
++    ): List<GoMangaChapterDataClass> {
++        goMangaChapterCache[mangaId] = chapters.associateBy { it.index }
++        return chapters
++    }
++
++    private fun storeGoMangaChapter(
++        mangaId: Int,
++        chapter: GoMangaChapterDataClass,
++    ): GoMangaChapterDataClass {
++        val cached = goMangaChapterCache[mangaId].orEmpty().toMutableMap()
++        val existing = cached[chapter.index]
++        cached[chapter.index] =
++            if (existing != null && existing.pageCount > 0 && chapter.pageCount <= 0) {
++                existing
++            } else {
++                chapter
++            }
++        goMangaChapterCache[mangaId] = cached
++        return cached.getValue(chapter.index)
++    }
++
++    private suspend fun getGoMangaChapterList(
++        mangaId: Int,
++        onlineFetch: Boolean,
++    ): List<GoMangaChapterDataClass> {
++        if (onlineFetch) {
++            return storeGoMangaChapterList(
++                mangaId,
++                Chapter
++                    .getChapterList(mangaId, onlineFetch = true)
++                    .map { it.toGoMangaChapter() },
++            )
++        }
++
++        val cached =
++            transaction {
++                val rows =
++                    ChapterTable
++                        .selectAll()
++                        .where { ChapterTable.manga eq mangaId }
++                        .orderBy(ChapterTable.sourceOrder to SortOrder.DESC)
++                        .toList()
++                val chapterCount = rows.size
++                rows.map { it.toGoMangaChapter(chapterCount) }
++            }
++        if (cached.isNotEmpty()) {
++            return storeGoMangaChapterList(mangaId, cached)
++        }
++        return storeGoMangaChapterList(
++            mangaId,
++            Chapter
++                .getChapterList(mangaId, onlineFetch = false)
++                .map { it.toGoMangaChapter() },
++        )
++    }
++
++    private fun getCachedGoMangaChapter(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): GoMangaChapterDataClass? {
++        goMangaChapterCache[mangaId]?.get(chapterIndex)?.let { return it }
++
++        val cached =
++            transaction {
++                ChapterTable
++                    .selectAll()
++                    .where { (ChapterTable.manga eq mangaId) and (ChapterTable.sourceOrder eq chapterIndex) }
++                    .firstOrNull()
++                    ?.toGoMangaChapter(chapterCount = null)
++            }
++        return cached?.let { storeGoMangaChapter(mangaId, it) }
++    }
++
++    private suspend fun getOnlineGoMangaChapter(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): GoMangaChapterDataClass =
++        storeGoMangaChapter(
++            mangaId,
++            getChapterDownloadReadyByIndex(chapterIndex, mangaId).toGoMangaChapter(),
++        )
++
++    private fun imageBytes(
++        ctx: Context,
++        image: Pair<InputStream, String>,
++    ) {
++        ctx.header("content-type", image.second)
++        val httpCacheSeconds = 1.days.inWholeSeconds
++        ctx.header("cache-control", "max-age=$httpCacheSeconds")
++        ctx.result(image.first)
++    }
+ 
+     val retrieve =
+         handler(
+@@ -56,10 +299,17 @@ object MangaController {
+             },
+             behaviorOf = { ctx, mangaId, onlineFetch ->
+                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
+-                ctx.future {
+-                    future {
+-                        Manga.getManga(mangaId, onlineFetch)
+-                    }.thenApply { ctx.json(it) }
++                if (slimMode()) {
++                    ctx.future {
++                        future { getGoMangaManga(mangaId, onlineFetch) }
++                            .thenApply { ctx.json(it) }
++                    }
++                } else {
++                    ctx.future {
++                        future {
++                            Manga.getManga(mangaId, onlineFetch)
++                        }.thenApply { ctx.json(it) }
++                    }
+                 }
+             },
+             withResults = {
+@@ -108,10 +358,7 @@ object MangaController {
+                 ctx.future {
+                     future { Manga.getMangaThumbnail(mangaId) }
+                         .thenApply {
+-                            ctx.header("content-type", it.second)
+-                            val httpCacheSeconds = 1.days.inWholeSeconds
+-                            ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-                            ctx.result(it.first)
++                            imageBytes(ctx, it)
+                         }
+                 }
+             },
+@@ -268,9 +515,16 @@ object MangaController {
+             },
+             behaviorOf = { ctx, mangaId, onlineFetch ->
+                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
+-                ctx.future {
+-                    future { Chapter.getChapterList(mangaId, onlineFetch) }
+-                        .thenApply { ctx.json(it) }
++                if (slimMode()) {
++                    ctx.future {
++                        future { getGoMangaChapterList(mangaId, onlineFetch) }
++                            .thenApply { ctx.json(it) }
++                    }
++                } else {
++                    ctx.future {
++                        future { Chapter.getChapterList(mangaId, onlineFetch) }
++                            .thenApply { ctx.json(it) }
++                    }
+                 }
+             },
+             withResults = {
+@@ -331,38 +585,52 @@ object MangaController {
+         handler(
+             pathParam<Int>("mangaId"),
+             pathParam<Int>("chapterIndex"),
++            queryParam("onlineFetch", false),
+             documentWith = {
+                 withOperation {
+                     summary("Get a chapter")
+                     description("Get the chapter from the manga id and chapter index. It will also retrieve the pages for this chapter.")
+                 }
+             },
+-            behaviorOf = { ctx, mangaId, chapterIndex ->
++            behaviorOf = { ctx, mangaId, chapterIndex, onlineFetch ->
+                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
+-                ctx.future {
+-                    future {
+-                        var chapter = getChapterDownloadReadyByIndex(chapterIndex, mangaId)
+-                        val syncResult = KoreaderSyncService.checkAndPullProgress(chapter.id)
+-
+-                        if (syncResult != null) {
+-                            if (syncResult.shouldUpdate) {
+-                                // Update DB for SILENT and RECEIVE
+-                                transaction {
+-                                    ChapterTable.update({ ChapterTable.id eq chapter.id }) {
+-                                        it[lastPageRead] = syncResult.pageRead
+-                                        it[lastReadAt] = syncResult.timestamp
++                if (slimMode()) {
++                    ctx.future {
++                        future {
++                            if (onlineFetch) {
++                                getOnlineGoMangaChapter(mangaId, chapterIndex)
++                            } else {
++                                val cached = getCachedGoMangaChapter(mangaId, chapterIndex)
++                                cached ?: throw NotFoundResponse("cached chapter not found")
++                            }
++                        }.thenApply { ctx.json(it) }
++                    }
++                } else {
++                    ctx.future {
++                        future {
++                            var chapter = getChapterDownloadReadyByIndex(chapterIndex, mangaId)
++                            val syncResult = KoreaderSyncService.checkAndPullProgress(chapter.id)
++
++                            if (syncResult != null) {
++                                if (syncResult.shouldUpdate) {
++                                    // Update DB for SILENT and RECEIVE
++                                    transaction {
++                                        ChapterTable.update({ ChapterTable.id eq chapter.id }) {
++                                            it[lastPageRead] = syncResult.pageRead
++                                            it[lastReadAt] = syncResult.timestamp
++                                        }
+                                     }
+                                 }
++                                // For PROMPT, SILENT, and RECEIVE, return the remote progress
++                                chapter =
++                                    chapter.copy(
++                                        lastPageRead = syncResult.pageRead,
++                                        lastReadAt = syncResult.timestamp,
++                                    )
+                             }
+-                            // For PROMPT, SILENT, and RECEIVE, return the remote progress
+-                            chapter =
+-                                chapter.copy(
+-                                    lastPageRead = syncResult.pageRead,
+-                                    lastReadAt = syncResult.timestamp,
+-                                )
+-                        }
+-                        chapter
+-                    }.thenApply { ctx.json(it) }
++                            chapter
++                        }.thenApply { ctx.json(it) }
++                    }
+                 }
+             },
+             withResults = {
+@@ -450,6 +718,32 @@ object MangaController {
+             },
+         )
+ 
++    /** get direct-first page image resources for a chapter */
++    val pageResourceList =
++        handler(
++            pathParam<Int>("mangaId"),
++            pathParam<Int>("chapterIndex"),
++            documentWith = {
++                withOperation {
++                    summary("Get chapter page image resources")
++                    description(
++                        "Get direct-first page image URLs, request headers, cache keys, and fallback proxy URLs for host-side image loading.",
++                    )
++                }
++            },
++            behaviorOf = { ctx, mangaId, chapterIndex ->
++                ctx.getAttribute(Attribute.TachideskUser).requireUser()
++                ctx.future {
++                    future { Page.getPageImageResources(mangaId, chapterIndex) }
++                        .thenApply { ctx.json(it) }
++                }
++            },
++            withResults = {
++                json<List<PageImageResourceDataClass>>(HttpStatus.OK)
++                httpCode(HttpStatus.NOT_FOUND)
++            },
++        )
++
+     /** get page at index "index" */
+     val pageRetrieve =
+         handler(
+@@ -483,10 +777,7 @@ object MangaController {
+                             format = format,
+                         )
+                     }.thenApply {
+-                        ctx.header("content-type", it.second)
+-                        val httpCacheSeconds = 1.days.inWholeSeconds
+-                        ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-                        ctx.result(it.first)
++                        imageBytes(ctx, it)
+ 
+                         if (updateProgress == true) {
+                             val chapterId = Chapter.updateChapterProgress(mangaId, chapterIndex, pageNo = index)
+@@ -546,4 +837,423 @@ object MangaController {
+                 httpCode(HttpStatus.NOT_FOUND)
+             },
+         )
++
++    // ──────────────────────────────────────────────────────────────────────
++    // GoManga no-DB source-URL addressing (source-token-addressing)
++    //
++    // Address detail / chapter-list / page-list by the REAL source URL via the
++    // extension SPI, performing NO MangaTable/ChapterTable/PageTable read or
++    // write — removing the H2 round-trip + write churn (MangaList.processEntries
++    // write-N-rows, Chapter delete+batchInsert) that degrades the
++    // pure-interpreter device JVM over a browsing session. The legacy DB-id
++    // routes above stay registered (additive). Source handles come from
++    // GetCatalogueSource (jar-cached by id; needs no manga DB row).
++    // ──────────────────────────────────────────────────────────────────────
++
++    /** Tachiyomi pages for a (sourceId, chapterURL), cached so the URL-keyed
++     *  proxy fallback does not re-run getPageList per page. */
++    private val goMangaUrlPageCache = ConcurrentHashMap<String, List<SourcePage>>()
++
++    private fun urlPageCacheKey(
++        sourceId: Long,
++        chapterUrl: String,
++    ): String = "$sourceId:$chapterUrl"
++
++    private fun urlPageProxyPath(
++        sourceId: Long,
++        chapterUrl: String,
++        index: Int,
++    ): String =
++        "/api/v1/source/$sourceId/manga/chapter/page-image?chapterUrl=" +
++            java.net.URLEncoder.encode(chapterUrl, "UTF-8") + "&index=$index"
++
++    private fun okhttp3.Headers.goMangaHeaderMap(): Map<String, String> = names().associateWith { get(it).orEmpty() }
++
++    private suspend fun goMangaTrueImageUrl(
++        page: SourcePage,
++        source: HttpSource,
++    ): String {
++        if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
++        return page.imageUrl!!
++    }
++
++    private suspend fun getGoMangaMangaByUrl(
++        sourceId: Long,
++        mangaUrl: String,
++    ): GoMangaMangaDataClass {
++        val source = getSourceOrStub(sourceId)
++        val sManga =
++            SManga.create().apply {
++                url = mangaUrl
++                title = mangaUrl
++            }
++        val details = source.getMangaUpdate(sManga, emptyList(), fetchDetails = true, fetchChapters = false).manga
++        return GoMangaMangaDataClass(
++            id = 0,
++            sourceId = sourceId.toString(),
++            url = mangaUrl,
++            title = details.title,
++            // Source-direct thumbnail URL (NOT proxyThumbnailUrl(mangaId): there
++            // is no DB id here, and the app loads covers app-direct anyway).
++            thumbnailUrl = details.thumbnail_url,
++            artist = details.artist,
++            author = details.author,
++            description = details.description,
++            genre = details.genre.toGoMangaGenreList(),
++            status = MangaStatus.valueOf(details.status).name,
++            inLibrary = false,
++            // realUrl = the source's own browsable page (mirror-aware), mirroring the
++            // DB path (Manga.kt → getMangaUrl). baozi (fork) overrides getMangaUrl
++            // to honor its v1.key.api_option mirror (e.g. tw.baozimh.com); happymh
++            // yields a real /manga page. The old baseUrl+url IGNORED those overrides,
++            // so "open website" + CF WebView verification used www.baozimh.com no
++            // matter which mirror the user picked.
++            realUrl = (source as? HttpSource)?.getMangaUrl(sManga),
++            lastFetchedAt = null,
++            chaptersLastFetchedAt = null,
++            chapterCount = null,
++        )
++    }
++
++    private suspend fun getGoMangaChaptersByUrl(
++        sourceId: Long,
++        mangaUrl: String,
++        mangaTitle: String,
++    ): List<GoMangaChapterDataClass> {
++        val source = getSourceOrStub(sourceId)
++        val sManga =
++            SManga.create().apply {
++                url = mangaUrl
++                title = mangaTitle
++            }
++        val chapters = source.getMangaUpdate(sManga, emptyList(), fetchDetails = false, fetchChapters = true).chapters
++        // Enrich identically to the DB path (Chapter.fetchChapterList) so chapter
++        // numbers / names match the legacy route — but write NO ChapterTable rows.
++        chapters.forEach { chapter ->
++            (source as? HttpSource)?.prepareNewChapter(chapter, sManga)
++            chapter.chapter_number =
++                ChapterRecognition
++                    .parseChapterNumber(mangaTitle, chapter.name, chapter.chapter_number.toDouble())
++                    .toFloat()
++            chapter.name = chapter.name.sanitize(mangaTitle)
++            chapter.scanlator = chapter.scanlator?.ifBlank { null }?.trim()
++        }
++        val count = chapters.size
++        // index mirrors ChapterTable.sourceOrder: sources return newest-first, so
++        // the newest chapter gets the highest index (the app sorts by index desc).
++        return chapters.mapIndexed { position, chapter ->
++            GoMangaChapterDataClass(
++                id = 0,
++                url = chapter.url,
++                name = chapter.name,
++                uploadDate = chapter.date_upload,
++                chapterNumber = chapter.chapter_number,
++                scanlator = chapter.scanlator,
++                mangaId = 0,
++                read = false,
++                bookmarked = false,
++                lastPageRead = 0,
++                lastReadAt = 0,
++                index = count - position,
++                fetchedAt = 0,
++                realUrl = null,
++                downloaded = false,
++                pageCount = 0,
++                chapterCount = count,
++            )
++        }
++    }
++
++    private suspend fun getGoMangaPagesByUrl(
++        sourceId: Long,
++        chapterUrl: String,
++    ): List<PageImageResourceDataClass> {
++        val source = getSourceOrStub(sourceId)
++        val pages = source.getPageList(SChapter.create().apply { url = chapterUrl })
++        goMangaUrlPageCache[urlPageCacheKey(sourceId, chapterUrl)] = pages
++        if (source !is HttpSource) {
++            return pages.map { page ->
++                PageImageResourceDataClass(
++                    index = page.index,
++                    imageUrl = null,
++                    cacheKey = "${urlPageCacheKey(sourceId, chapterUrl)}:${page.index}:${page.url}",
++                    fallbackImageUrl = urlPageProxyPath(sourceId, chapterUrl, page.index),
++                    requiresProxy = true,
++                )
++            }
++        }
++        val headers = source.headers.goMangaHeaderMap()
++        return pages.map { page ->
++            val imageUrl =
++                try {
++                    goMangaTrueImageUrl(page, source)
++                } catch (_: Exception) {
++                    null
++                }
++            PageImageResourceDataClass(
++                index = page.index,
++                imageUrl = imageUrl,
++                headers = headers,
++                cacheKey = "${urlPageCacheKey(sourceId, chapterUrl)}:${page.index}:${imageUrl ?: page.url}",
++                fallbackImageUrl = urlPageProxyPath(sourceId, chapterUrl, page.index),
++                requiresProxy = imageUrl == null,
++            )
++        }
++    }
++
++    private suspend fun getGoMangaPageImageByUrl(
++        sourceId: Long,
++        chapterUrl: String,
++        index: Int,
++    ): Pair<InputStream, String> {
++        val source = getSourceOrStub(sourceId)
++        val key = urlPageCacheKey(sourceId, chapterUrl)
++        val pages =
++            goMangaUrlPageCache[key]
++                ?: source
++                    .getPageList(SChapter.create().apply { url = chapterUrl })
++                    .also { goMangaUrlPageCache[key] = it }
++        val page =
++            pages.firstOrNull { it.index == index }
++                ?: pages.getOrNull(index)
++                ?: throw NotFoundResponse("page $index not found for $chapterUrl")
++        // LocalSource (and any non-HTTP source) serves page bytes from disk, not
++        // OkHttp. Materialize eagerly (like the HttpSource path below) so the bytes
++        // are still valid when Javalin streams the future's result — a lazy
++        // FileInputStream is already closed by then (IOException: Stream Closed).
++        // Archive chapters expose entries via LocalSource.pageCache (keyed by the
++        // no-DB chapterUrl); directory chapters carry an absolute file path in
++        // page.imageUrl.
++        if (source !is HttpSource) {
++            val cached = eu.kanade.tachiyomi.source.local.LocalSource.pageCache[chapterUrl]?.getOrNull(index)
++            val bytes: ByteArray =
++                if (cached != null) {
++                    cached().use { it.readBytes() }
++                } else {
++                    val filePath =
++                        page.imageUrl
++                            ?: throw NotFoundResponse("page $index has no local source for $chapterUrl")
++                    java.io.File(filePath).inputStream().use { it.readBytes() }
++                }
++            val contentType =
++                suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
++                    .findImageType { java.io.ByteArrayInputStream(bytes) }
++                    ?.mime ?: "image/jpeg"
++            return java.io.ByteArrayInputStream(bytes) to contentType
++        }
++        if (page.imageUrl == null) page.imageUrl = source.getImageUrl(page)
++        val response = source.getImage(page)
++        val contentType = response.header("content-type") ?: "image/jpeg"
++        // Materialize the bytes WHILE the OkHttp Response is open. The slim route
++        // returns this via `ctx.future{…}.thenApply{imageBytes}` and Javalin streams
++        // the result AFTER the future resolves — by then `response` is out of scope
++        // and OkHttp has closed its body, so returning the lazy `byteStream()` threw
++        // `java.io.IOException: closed` (the manhuaren reader 500). Reading into a
++        // ByteArrayInputStream here keeps it valid; per-request heap stays bounded by
++        // the 32/8 OkHttp dispatcher cap (embedded-jvm-runtime-tuning 1.1).
++        val bytes = response.use { it.body?.bytes() } ?: throw NotFoundResponse("empty image body")
++        return java.io.ByteArrayInputStream(bytes) to contentType
++    }
++
++    // Plain Javalin handlers (NOT the `handler(...)` util): that util wraps every
++    // route in Javalin's OpenAPI `documented(...)` handler, whose request-time
++    // lambda throws NullPointerException for these routes in the slim embedded
++    // server — which surfaces as a 404. The no-DB routes therefore register as
++    // plain handlers; the JSON response is still produced by `ctx.future`
++    // rendering the future's object result, exactly as the util's behaviorOf does
++    // (cf. the slim `retrieve` handler). Each handler keeps the v2 auth gate
++    // `requireUser()` as its first statement, matching the stock handlers.
++
++    /** detail by real source URL (no DB) */
++    val mangaDetailByUrl =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future { future { getGoMangaMangaByUrl(ctx.pathParam("sourceId").toLong(), url) }.thenApply { ctx.json(it) } }
++            }
++        }
++
++    /** chapter list by real source URL (no DB) */
++    val chapterListByUrl =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future {
++                    future {
++                        getGoMangaChaptersByUrl(
++                            ctx.pathParam("sourceId").toLong(),
++                            url,
++                            ctx.queryParam("title").orEmpty(),
++                        )
++                    }.thenApply { ctx.json(it) }
++                }
++            }
++        }
++
++    /** page resource list by real chapter URL (no DB) */
++    val pageResourceListByUrl =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val url = ctx.queryParam("url").orEmpty()
++            if (url.isBlank()) {
++                ctx.status(400)
++            } else {
++                ctx.future { future { getGoMangaPagesByUrl(ctx.pathParam("sourceId").toLong(), url) }.thenApply { ctx.json(it) } }
++            }
++        }
++
++    /** URL-keyed page-image proxy (last-resort fallback for the no-DB path) */
++    val pageImageByUrl =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val chapterUrl = ctx.queryParam("chapterUrl").orEmpty()
++            if (chapterUrl.isBlank()) {
++                ctx.status(400)
++            } else {
++                val index = ctx.queryParam("index")?.toIntOrNull() ?: 0
++                ctx.future {
++                    future { getGoMangaPageImageByUrl(ctx.pathParam("sourceId").toLong(), chapterUrl, index) }
++                        .thenApply { imageBytes(ctx, it) }
++                }
++            }
++        }
++
++    // ──────────────────────────────────────────────────────────────────────
++    // host-owned-cookie-routing 4.1: proactive server cookie seed
++    //
++    // The host pushes a verified host's FULL cookie set (not cf_clearance only)
++    // into the server's OkHttp jar PROACTIVELY (on boot / after verification),
++    // so the first source-parsing request to a Cloudflare host already carries
++    // the clearance instead of taking a 403 -> FlareSolverr /v1 round-trip. The
++    // reactive /v1 pull (CloudflareInterceptor) stays as the fallback. Plain
++    // data classes (Javalin's mapper) — no @Serializable, so the class-swap
++    // recompile needs no serialization plugin.
++    // ──────────────────────────────────────────────────────────────────────
++
++    private val networkHelper: NetworkHelper by injectLazy()
++
++    data class GoMangaSeedCookie(
++        val name: String,
++        val value: String,
++        val domain: String,
++        val path: String = "/",
++    )
++
++    data class GoMangaCookieSeedRequest(
++        val host: String,
++        val cookies: List<GoMangaSeedCookie>,
++        val userAgent: String = "",
++        val clearanceOnly: Boolean = false,
++    )
++
++    private fun seedHostCookies(req: GoMangaCookieSeedRequest) {
++        val host = req.host.removePrefix(".")
++        if (host.isBlank()) return
++        if (req.cookies.isEmpty()) {
++            if (req.clearanceOnly) {
++                networkHelper.cookieStore.removeNamedForHost(host, setOf("cf_clearance"))
++            } else {
++                networkHelper.cookieStore.removeHost(host)
++            }
++            return
++        }
++        val cookies =
++            req.cookies.map { c ->
++                Cookie
++                    .Builder()
++                    .name(c.name)
++                    .value(c.value)
++                    .domain(c.domain.removePrefix("."))
++                    .path(c.path.ifBlank { "/" })
++                    .build()
++            }
++        networkHelper.cookieStore.replaceNamedForHost(host, setOf("cf_clearance"), cookies)
++        // GoMangaStableDefaultUA: the clearance UA deliberately does NOT touch
++        // the server-wide default UA. Per-host clearance/UA pairing lives in the
++        // host-side FlareSolverr shim, and the CloudflareInterceptor forces that
++        // UA onto each CF-walled request. Adopting it globally degraded
++        // UA-sensitive source APIs (happymh page-list under a mobile Safari UA).
++        // req.userAgent stays on the wire format for compatibility.
++    }
++
++    /** Proactively seed the server OkHttp jar with a verified host's cookies. */
++    val cfCookieSeed =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val req =
++                try {
++                    ctx.bodyAsClass(GoMangaCookieSeedRequest::class.java)
++                } catch (_: Exception) {
++                    ctx.status(400)
++                    return@Handler
++                }
++            seedHostCookies(req)
++            ctx.status(200)
++        }
++
++    // GoMangaServerUserAgent: plain data class (Javalin Jackson, no @Serializable
++    // → no serialization-plugin recompile trap).
++    data class GoMangaDefaultUaRequest(
++        val userAgent: String = "",
++    )
++
++    /**
++     * Set the server's default HTTP-client User-Agent for source requests.
++     * The host calls this ONCE at boot with a STABLE ecosystem UA (the
++     * Tachiyomi/Mihon-family default the extensions are tested against), NOT
++     * the device WebKit UA — UA-sensitive source APIs degrade under a mobile
++     * Safari UA (happymh page-list). Cloudflare clearance/UA pairing is
++     * per-request via the CloudflareInterceptor + FlareSolverr shim instead.
++     * Idempotent via NetworkHelper's guard.
++     */
++    val gomangaDefaultUa =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val req =
++                try {
++                    ctx.bodyAsClass(GoMangaDefaultUaRequest::class.java)
++                } catch (_: Exception) {
++                    ctx.status(400)
++                    return@Handler
++                }
++            if (req.userAgent.isNotBlank()) {
++                networkHelper.setDefaultUserAgent(req.userAgent)
++            }
++            ctx.status(200)
++        }
++
++    // GoMangaInsecureHttpGate: plain data class (Javalin Jackson, no
++    // @Serializable → no serialization-plugin recompile trap), same as the UA
++    // route. Fail-closed default: a malformed/missing body reads allowed=false.
++    data class GoMangaAllowInsecureHttpRequest(
++        val allowed: Boolean = false,
++    )
++
++    /**
++     * Mirror the app-side InsecureSourcePolicy ("允許不安全的來源") onto the
++     * server's source-fetch OkHttp egress (CleartextGuardInterceptor). The host
++     * calls this at boot with the user's current opt-in and again live on every
++     * toggle flip; the interceptor reads the value per request, so no source
++     * rebuild is needed. Fail-closed: an unparseable body leaves the server's
++     * current value untouched via the 400 short-circuit.
++     */
++    val gomangaAllowInsecureHttp =
++        io.javalin.http.Handler { ctx ->
++            ctx.getAttribute(Attribute.TachideskUser).requireUser()
++            val req =
++                try {
++                    ctx.bodyAsClass(GoMangaAllowInsecureHttpRequest::class.java)
++                } catch (_: Exception) {
++                    ctx.status(400)
++                    return@Handler
++                }
++            networkHelper.setAllowInsecureHttp(req.allowed)
++            ctx.status(200)
++        }
+ }
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
+index 4a8753e0..39c45e06 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/MangaList.kt
+@@ -9,6 +9,7 @@ package suwayomi.tachidesk.manga.impl
+ 
+ import eu.kanade.tachiyomi.source.local.LocalSource
+ import eu.kanade.tachiyomi.source.model.MangasPage
++import eu.kanade.tachiyomi.source.online.HttpSource
+ import kotlinx.serialization.json.Json
+ import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.dao.id.EntityID
+@@ -28,6 +29,19 @@ import java.time.Instant
+ object MangaList {
+     fun proxyThumbnailUrl(mangaId: Int): String = "/api/v1/manga/$mangaId/thumbnail"
+ 
++    private fun slimMode(): Boolean =
++        System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++
++    // GoManga app-direct covers: the source's request headers (UA / Referer / …) so the
++    // app can fetch catalog covers straight from the CDN. slim-only — the source-handle
++    // lookup is pointless for the stock desktop server, which keeps the proxy thumbnailUrl.
++    private fun goMangaCoverHeaders(sourceId: Long): Map<String, String> {
++        if (!slimMode()) return emptyMap()
++        val source = getSourceOrStub(sourceId) as? HttpSource ?: return emptyMap()
++        val headers = source.headers
++        return headers.names().associateWith { headers.get(it).orEmpty() }
++    }
++
+     suspend fun getMangaList(
+         sourceId: Long,
+         pageNum: Int = 1,
+@@ -130,10 +144,14 @@ object MangaList {
+ 
+     fun MangasPage.processEntries(sourceId: Long): PagedMangaListDataClass {
+         val mangasPage = this
++        // Computed OUTSIDE the transaction (jar-cached source-handle lookup, not DB I/O).
++        // slim-only; stock desktop keeps the empty map + proxy thumbnailUrl.
++        val coverHeaders = goMangaCoverHeaders(sourceId)
+         val mangaList =
+             transaction {
+                 val mangaIds = insertOrUpdate(sourceId)
+-                return@transaction MangaTable.selectAll().where { MangaTable.id inList mangaIds }.map { MangaTable.toDataClass(it) }
++                return@transaction MangaTable.selectAll().where { MangaTable.id inList mangaIds }
++                    .map { MangaTable.toDataClass(it, coverRequestHeaders = coverHeaders) }
+             }
+         return PagedMangaListDataClass(
+             mangaList,
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
+index 10f9fe03..b512f40b 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/Page.kt
+@@ -13,6 +13,8 @@ import eu.kanade.tachiyomi.source.online.HttpSource
+ import io.github.oshai.kotlinlogging.KotlinLogging
+ import kotlinx.coroutines.flow.StateFlow
+ import libcore.net.MimeUtils
++import okhttp3.Headers
++import org.jetbrains.exposed.v1.core.ResultRow
+ import org.jetbrains.exposed.v1.core.SortOrder
+ import org.jetbrains.exposed.v1.core.and
+ import org.jetbrains.exposed.v1.core.eq
+@@ -20,10 +22,12 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
+ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+ import org.jetbrains.exposed.v1.jdbc.update
+ import suwayomi.tachidesk.graphql.types.DownloadConversion
++import suwayomi.tachidesk.manga.impl.chapter.getChapterDownloadReadyByIndex
+ import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
+ import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
+ import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
+ import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
++import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
+ import suwayomi.tachidesk.manga.model.table.ChapterTable
+ import suwayomi.tachidesk.manga.model.table.MangaTable
+ import suwayomi.tachidesk.manga.model.table.PageTable
+@@ -41,6 +45,59 @@ import javax.imageio.ImageWriter
+ object Page {
+     private val logger = KotlinLogging.logger {}
+ 
++    private fun pageProxyPath(
++        mangaId: Int,
++        chapterIndex: Int,
++        index: Int,
++    ): String = "/api/v1/manga/$mangaId/chapter/$chapterIndex/page/$index"
++
++    private fun pageCacheKey(
++        mangaId: Int,
++        chapterIndex: Int,
++        index: Int,
++        imageUrl: String?,
++        pageUrl: String,
++    ): String = "suwayomi-page:$mangaId:$chapterIndex:$index:${imageUrl ?: pageUrl}"
++
++    private fun Headers.toHeaderMap(): Map<String, String> = names().associateWith { name -> get(name).orEmpty() }
++
++    private fun pageRowsForChapter(chapterId: Int): List<ResultRow> =
++        transaction {
++            PageTable
++                .selectAll()
++                .where { PageTable.chapter eq chapterId }
++                .orderBy(PageTable.index to SortOrder.ASC)
++                .toList()
++        }
++
++    private suspend fun resolveHttpImageUrl(
++        pageEntry: ResultRow,
++        chapterId: Int,
++        source: HttpSource,
++    ): String? {
++        val cached = pageEntry[PageTable.imageUrl]
++        if (cached != null) return cached
++
++        val tachiyomiPage =
++            Page(
++                pageEntry[PageTable.index],
++                pageEntry[PageTable.url],
++                null,
++            )
++        val trueImageUrl =
++            try {
++                getTrueImageUrl(tachiyomiPage, source)
++            } catch (_: Exception) {
++                return null
++            }
++        transaction {
++            PageTable.update({ (PageTable.chapter eq chapterId) and (PageTable.index eq pageEntry[PageTable.index]) }) {
++                it[imageUrl] = trueImageUrl
++            }
++        }
++        return trueImageUrl
++    }
++
+     /**
+      * A page might have a imageUrl ready from the get go, or we might need to
+      * go an extra step and call fetchImageUrl to get it.
+@@ -55,6 +112,62 @@ object Page {
+         return page.imageUrl!!
+     }
+ 
++    suspend fun getPageImageResources(
++        mangaId: Int,
++        chapterIndex: Int,
++    ): List<PageImageResourceDataClass> {
++        val mangaEntry = transaction { MangaTable.selectAll().where { MangaTable.id eq mangaId }.first() }
++        val source = getSourceOrStub(mangaEntry[MangaTable.sourceReference])
++        var chapterEntry =
++            transaction {
++                ChapterTable
++                    .selectAll()
++                    .where { (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId) }
++                    .first()
++            }
++        val chapterId = chapterEntry[ChapterTable.id].value
++
++        var pageRows = pageRowsForChapter(chapterId)
++        if (pageRows.isEmpty() || chapterEntry[ChapterTable.pageCount] <= 0) {
++            getChapterDownloadReadyByIndex(chapterIndex, mangaId)
++            chapterEntry =
++                transaction {
++                    ChapterTable
++                        .selectAll()
++                        .where { (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId) }
++                        .first()
++                }
++            pageRows = pageRowsForChapter(chapterEntry[ChapterTable.id].value)
++        }
++
++        if (source !is HttpSource) {
++            return pageRows.map { pageEntry ->
++                val index = pageEntry[PageTable.index]
++                PageImageResourceDataClass(
++                    index = index,
++                    imageUrl = null,
++                    cacheKey = pageCacheKey(mangaId, chapterIndex, index, null, pageEntry[PageTable.url]),
++                    fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
++                    requiresProxy = true,
++                )
++            }
++        }
++
++        val headers = source.headers.toHeaderMap()
++        return pageRows.map { pageEntry ->
++            val index = pageEntry[PageTable.index]
++            val imageUrl = resolveHttpImageUrl(pageEntry, chapterEntry[ChapterTable.id].value, source)
++            PageImageResourceDataClass(
++                index = index,
++                imageUrl = imageUrl,
++                headers = headers,
++                cacheKey = pageCacheKey(mangaId, chapterIndex, index, imageUrl, pageEntry[PageTable.url]),
++                fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
++                requiresProxy = imageUrl == null,
++            )
++        }
++    }
++
+     suspend fun getPageImage(
+         mangaId: Int,
+         chapterId: Int? = null,
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/BytecodeEditor.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/BytecodeEditor.kt
+index 2a64ae0c..d4638fa5 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/BytecodeEditor.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/impl/util/BytecodeEditor.kt
+@@ -15,6 +15,18 @@ import org.objectweb.asm.FieldVisitor
+ import org.objectweb.asm.Handle
+ import org.objectweb.asm.MethodVisitor
+ import org.objectweb.asm.Opcodes
++import org.objectweb.asm.Type
++import org.objectweb.asm.tree.AbstractInsnNode
++import org.objectweb.asm.tree.ClassNode
++import org.objectweb.asm.tree.FieldInsnNode
++import org.objectweb.asm.tree.InsnNode
++import org.objectweb.asm.tree.JumpInsnNode
++import org.objectweb.asm.tree.LabelNode
++import org.objectweb.asm.tree.MethodInsnNode
++import org.objectweb.asm.tree.MethodNode
++import org.objectweb.asm.tree.TypeInsnNode
++import org.objectweb.asm.tree.VarInsnNode
++import java.net.URLClassLoader
+ import java.nio.file.FileSystems
+ import java.nio.file.Files
+ import java.nio.file.Path
+@@ -40,6 +52,153 @@ object BytecodeEditor {
+                 .map(::transform)
+                 .forEach(::write)
+         }
++        // GoManga: make R8-optimised extension bytecode strict-JVM-verifiable so it
++        // loads under -Xverify:remote (and is native-safe on the iOS/arm64 OpenJ9
++        // device, where -Xverify:none crashes on type-unsafe bytecode). See
++        // repairR8NewInstances.
++        try {
++            repairR8NewInstances(jarFile)
++        } catch (e: Throwable) {
++            // Never fail the whole install because the repair pass tripped — the
++            // unrepaired jar just keeps its pre-existing verify behaviour.
++            logger.error(e) { "repairR8NewInstances failed for $jarFile; leaving jar unrepaired" }
++        }
++    }
++
++    /**
++     * Make dex2jar-converted extension bytecode strict-JVM-verifiable.
++     *
++     * dex2jar 2.4.37's NewTransformer takes the allocation type of a merged
++     * new+<init> from the `<init>` invoke's OWNER instead of the NEW instruction's
++     * real type. When R8 constructor-inlining/tree-shaking strips an obfuscated
++     * subclass T's own <init>, the DEX legally emits `new-instance LT;` +
++     * `invoke-direct <SuperOfT>.<init>(desc)`, so dex2jar collapses `new T` into
++     * `new <Super>` (commonly `new java/lang/Object`). The class is then used as T
++     * (putfield T.f / stored into an LT;-typed field), which OpenJ9's verifier
++     * rejects (JVMVRFY012 "Type ... is not assignable to T") — so under
++     * -Xverify:remote the source fails to install, and under -Xverify:none the same
++     * bytecode native-crashes the arm64 device (a type-confused field write).
++     *
++     * This pass, run after dex2jar + the SimpleDateFormat fixups above:
++     *   1. rewrites `new Super` back to `new T` (+ `invokespecial Super.<init>` to
++     *      `invokespecial T.<init>`), recovering T from the value's sink (the
++     *      putfield/putstatic field descriptor, the putfield owner, or a checkcast),
++     *      only when T directly extends Super so the super-ctor call stays legal;
++     *   2. synthesises a delegating `T.<init>(desc){ super(desc) }` for every
++     *      rewritten T whose own <init> R8 removed (field init already happens at the
++     *      call site via putfields, so this is behaviour-preserving); a still-missing
++     *      ctor would surface only as a clean, catchable NoSuchMethodError, never a
++     *      native crash;
++     *   3. rewrites every class with COMPUTE_FRAMES + a jar-aware getCommonSuperClass
++     *      so the StackMapTable dex2jar mis-emitted is recomputed correctly.
++     *
++     * Verified on host OpenJ9 25: baozimanhua (24/24) and happymh (55/55) classes
++     * go from 12 / 30 verify errors to 0, passing -Xverify:remote.
++     */
++    fun repairR8NewInstances(jarFile: Path) {
++        val nodes = LinkedHashMap<String, ClassNode>()
++        val superOf = HashMap<String, String?>()
++        val initDescs = HashMap<String, MutableSet<String>>()
++        FileSystems.newFileSystem(jarFile, null as ClassLoader?)?.use { fs ->
++            Files.walk(fs.getPath("/")).asSequence().filterNotNull().filterNot(Files::isDirectory).forEach { p ->
++                if (!p.toString().endsWith(".class")) return@forEach
++                val cn = ClassNode()
++                ClassReader(Files.readAllBytes(p)).accept(cn, 0)
++                nodes[p.toString()] = cn
++                superOf[cn.name] = cn.superName
++                initDescs.getOrPut(cn.name) { mutableSetOf() }.addAll(cn.methods.filter { it.name == "<init>" }.map { it.desc })
++            }
++        }
++
++        // Detect R8-stripped constructors. The vendored dex2jar NewTransformer patch
++        // already recovers the real allocation type T (`new T`, from the DEX
++        // new-instance) instead of the <init> invoke's owner. What remains is that R8
++        // inlined T's own constructor, so the recovered `new T; invokespecial T.<init>(desc)`
++        // links to a T.<init> that no longer exists — a run-time NoSuchMethodError — AND
++        // the StackMapTable frames dex2jar emitted are stale w.r.t. the recovered types
++        // (JVMVRFY012 "stack shape inconsistent"). A `new T; invokespecial T.<init>(desc)`
++        // where T is a jar-local class missing that ctor is the exact fingerprint of this
++        // R8 collapse: it is the trigger to both synthesise the ctor and reframe.
++        //
++        // needCtor: T -> { ctorDesc } — one synthesised T.<init>(desc) per missing desc,
++        // each delegating to superOf[T].<init>(desc) (that super ctor survived, because R8
++        // rewrote the inlined call to it). base for the super chain is superOf[T].
++        val needCtor = LinkedHashMap<String, LinkedHashSet<String>>()
++        for (cn in nodes.values) {
++            for (m in cn.methods) {
++                val arr = m.instructions.toArray()
++                for (i in arr.indices) {
++                    val ti = arr[i] as? TypeInsnNode ?: continue
++                    if (ti.opcode != Opcodes.NEW) continue
++                    val t = ti.desc
++                    if (!superOf.containsKey(t)) continue // only jar-local classes we can add a ctor to
++                    // matching invokespecial T.<init> (ctor args may sit between the new and it)
++                    var j = i + 1
++                    while (j < minOf(i + 24, arr.size)) {
++                        val y = arr[j]
++                        if (y is JumpInsnNode || y is LabelNode) break
++                        if (y is MethodInsnNode && y.opcode == Opcodes.INVOKESPECIAL && y.owner == t && y.name == "<init>") {
++                            if (initDescs[t]?.contains(y.desc) != true) {
++                                needCtor.getOrPut(t) { LinkedHashSet() }.add(y.desc)
++                            }
++                            break
++                        }
++                        j++
++                    }
++                }
++            }
++        }
++
++        if (needCtor.isEmpty()) return // no R8-collapsed new-instance — leave the jar (and its frames) untouched
++
++        var synth = 0
++        for (cn in nodes.values) {
++            val descs = needCtor[cn.name] ?: continue
++            val base = superOf[cn.name] ?: "java/lang/Object"
++            for (desc in descs) {
++                val c = MethodNode(Opcodes.ACC_PUBLIC, "<init>", desc, null, null)
++                c.instructions.add(VarInsnNode(Opcodes.ALOAD, 0))
++                var local = 1
++                for (at in Type.getArgumentTypes(desc)) {
++                    c.instructions.add(VarInsnNode(at.getOpcode(Opcodes.ILOAD), local))
++                    local += at.size
++                }
++                c.instructions.add(MethodInsnNode(Opcodes.INVOKESPECIAL, base, "<init>", desc, false))
++                c.instructions.add(InsnNode(Opcodes.RETURN))
++                c.maxStack = maxOf(1, local)
++                c.maxLocals = local
++                cn.methods.add(c)
++                synth++
++            }
++        }
++
++        // COMPUTE_FRAMES with a getCommonSuperClass that can resolve the extension's
++        // own (obfuscated) classes from the still-intact jar; write outputs to memory
++        // first, then back to the jar so the resolving loader never races the write.
++        val jarCL = URLClassLoader(arrayOf(jarFile.toUri().toURL()), BytecodeEditor::class.java.classLoader)
++        val out = LinkedHashMap<String, ByteArray>()
++        jarCL.use { cl ->
++            for ((path, cn) in nodes) {
++                val cw =
++                    object : ClassWriter(COMPUTE_FRAMES) {
++                        override fun getClassLoader(): ClassLoader = cl
++                        override fun getCommonSuperClass(type1: String, type2: String): String =
++                            try {
++                                super.getCommonSuperClass(type1, type2)
++                            } catch (e: Throwable) {
++                                "java/lang/Object"
++                            }
++                    }
++                cn.accept(cw)
++                out[path] = cw.toByteArray()
++            }
++        }
++        FileSystems.newFileSystem(jarFile, null as ClassLoader?)?.use { fs ->
++            for ((path, bytes) in out) {
++                Files.write(fs.getPath(path), bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
++            }
++        }
++        logger.info { "repairR8NewInstances($jarFile): synthesised $synth R8-stripped ctor(s), reframed ${out.size} class(es)" }
+     }
+ 
+     /**
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
+index 1d49bf1d..d23ff62c 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/MangaDataClass.kt
+@@ -50,6 +50,21 @@ data class MangaDataClass(
+     @JsonIgnore
+     val memo: JsonObject = JsonObject.EMPTY,
+ ) {
++    // GoManga app-direct covers: source-direct ABSOLUTE cover URL + the source's
++    // request headers, so the catalog grid fetches covers straight from the CDN
++    // (single hop) instead of the embedded-server /thumbnail proxy (the double hop
++    // that saturates the server OkHttp dispatcher and starves chapter/detail calls).
++    // stock thumbnailUrl stays the proxy URL = the app-direct FALLBACK.
++    //
++    // BODY properties (not constructor params) so this stays BINARY-COMPATIBLE for the
++    // class-swap build: the primary constructor, copy(), and componentN() signatures
++    // are unchanged, so existing compiled callers (CategoryManga / DownloadManager /
++    // Manga / GraphQL) keep linking against the un-recompiled jar. Set post-construction
++    // by MangaTable.toDataClass; serialized by Javalin/Jackson via the generated getter
++    // (plain data class — no @Serializable plugin needed for the recompile).
++    var coverThumbnailUrl: String? = null
++    var coverHeaders: Map<String, String> = emptyMap()
++
+     override fun toString(): String = "\"$title\" (id= $id) (sourceId= $sourceId)"
+ 
+     @Deprecated("Remove with V1 Api")
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
+index 48cfbc65..42bbc36b 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/dataclass/PageDataClass.kt
+@@ -11,3 +11,12 @@ data class PageDataClass(
+     val index: Int,
+     var imageUrl: String,
+ )
++
++data class PageImageResourceDataClass(
++    val index: Int,
++    val imageUrl: String?,
++    val headers: Map<String, String> = emptyMap(),
++    val cacheKey: String,
++    val fallbackImageUrl: String,
++    val requiresProxy: Boolean = false,
++)
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
+index d4087c84..c7d25463 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/manga/model/table/MangaTable.kt
+@@ -52,7 +52,10 @@ object MangaTable : IntIdTable() {
+     val memo = unlimitedVarchar("memo")
+ }
+ 
+-fun MangaTable.toDataClass(mangaEntry: ResultRow) =
++fun MangaTable.toDataClass(
++    mangaEntry: ResultRow,
++    coverRequestHeaders: Map<String, String> = emptyMap(),
++) =
+     MangaDataClass(
+         id = mangaEntry[this.id].value,
+         sourceId = mangaEntry[sourceReference].toString(),
+@@ -75,7 +78,13 @@ fun MangaTable.toDataClass(mangaEntry: ResultRow) =
+         lastModifiedAt = mangaEntry[lastModifiedAt],
+         version = mangaEntry[version],
+         memo = Json.decodeFromString(mangaEntry[memo]),
+-    )
++    ).apply {
++        // GoManga app-direct covers: source-direct absolute URL (stock thumbnailUrl
++        // stays the /thumbnail proxy = fallback) + the source's request headers.
++        // Set as BODY props (not ctor args) so MangaDataClass stays binary-compatible.
++        coverThumbnailUrl = mangaEntry[thumbnail_url]
++        coverHeaders = coverRequestHeaders
++    }
+ 
+ enum class MangaStatus(
+     val value: Int,
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/server/JavalinSetup.kt b/server/src/main/kotlin/suwayomi/tachidesk/server/JavalinSetup.kt
+index 1f2835af..e12959b7 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/server/JavalinSetup.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/server/JavalinSetup.kt
+@@ -12,6 +12,7 @@ import gg.jte.TemplateEngine
+ import io.github.oshai.kotlinlogging.KotlinLogging
+ import io.javalin.Javalin
+ import io.javalin.apibuilder.ApiBuilder.after
++import io.javalin.apibuilder.ApiBuilder.get
+ import io.javalin.apibuilder.ApiBuilder.path
+ import io.javalin.config.RoutesConfig
+ import io.javalin.http.Context
+@@ -33,6 +34,7 @@ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withTimeoutOrNull
+ import org.eclipse.jetty.server.ServerConnector
+ import suwayomi.tachidesk.global.GlobalAPI
++import suwayomi.tachidesk.global.controller.SettingsController
+ import suwayomi.tachidesk.graphql.GraphQL
+ import suwayomi.tachidesk.graphql.types.AuthMode
+ import suwayomi.tachidesk.i18n.LocalizationHelper
+@@ -60,9 +62,30 @@ object JavalinSetup {
+ 
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+ 
++    /**
++     * GoManga: the live Javalin app, retained so the embedded HTTP server can be
++     * restarted inside the already-running JVM (the JVM itself is a per-process
++     * singleton and cannot be re-created on iOS). Set after each [javalinSetup].
++     */
++    @Volatile
++    private var currentApp: Javalin? = null
++
++    /** GoManga: the JVM-shutdown hook is process-scoped — install it only once. */
++    @Volatile
++    private var shutdownHookInstalled = false
++
+     fun <T> future(block: suspend CoroutineScope.() -> T): CompletableFuture<T> = scope.future(block = block)
+ 
+     fun javalinSetup() {
++        // ── GoManga slim-mode ──
++        // The iOS GoManga embed uses Suwayomi only as an extension parser host, so
++        // it registers ONLY the minimal route surface (settings/about readiness +
++        // the MangaAPI source/manga route groups) and skips the full stock REST/
++        // OPDS/WebSocket/GraphQL/webUI surface + the desktop auth wiring to cut
++        // cold start. GraphQL can be re-enabled independently for debugging.
++        val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++        val graphQLEnabled =
++            !slimMode || System.getProperty("suwayomi.tachidesk.gomanga.graphqlEnabled", "false") == "true"
+         val app =
+             Javalin.start { config ->
+                 val templateEngine = TemplateEngine.createPrecompiled(ContentType.Html)
+@@ -70,7 +93,11 @@ object JavalinSetup {
+ 
+                 config.jsonMapper(JavalinJackson3())
+ 
+-                WebInterfaceManager.setup(config)
++                // GoManga: skip webUI static-file serving (and its async copy/setup
++                // I/O) in slim mode — the iOS embed never serves the SPA.
++                if (!slimMode) {
++                    WebInterfaceManager.setup(config)
++                }
+ 
+                 // config.registerPlugin(OpenApiPlugin(getOpenApiOptions()))
+ 
+@@ -105,154 +132,218 @@ object JavalinSetup {
+                     }
+                 }
+ 
+-                config.bundledPlugins.enableCors { cors ->
+-                    cors.addRule {
+-                        it.allowCredentials = true
+-                        it.reflectClientOrigin = true
++                // GoManga: the iOS embed talks to a fixed loopback origin and never
++                // needs browser CORS; skip it in slim mode.
++                if (!slimMode) {
++                    config.bundledPlugins.enableCors { cors ->
++                        cors.addRule {
++                            it.allowCredentials = true
++                            it.reflectClientOrigin = true
++                        }
+                     }
+                 }
+ 
+                 config.routes.defineCore()
+                 config.routes.apiBuilder {
+                     path(ServerSubpath.maybeAddAsPrefix("api/")) {
+-                        path("v1/") {
+-                            GlobalAPI.defineEndpoints()
+-                            MangaAPI.defineEndpoints()
+-                        }
++                        if (slimMode) {
++                            // GoManga slim surface: ONLY the readiness probe the host
++                            // polls + the MangaAPI route groups (extension/source/
++                            // manga, plus the gomanga groups the other patches add).
++                            // Stock GlobalAPI/OPDS and the catch-all 404 are dropped.
++                            path("v1/") {
++                                path("settings") {
++                                    get("about", SettingsController.about)
++                                }
++                                MangaAPI.defineEndpoints()
++                            }
++                            if (graphQLEnabled) {
++                                GraphQL.defineEndpoints()
++                            }
++                        } else {
++                            path("v1/") {
++                                GlobalAPI.defineEndpoints()
++                                MangaAPI.defineEndpoints()
++                            }
+ 
+-                        OpdsAPI.defineEndpoints()
+-                        GraphQL.defineEndpoints()
++                            OpdsAPI.defineEndpoints()
++                            GraphQL.defineEndpoints()
+ 
+-                        after { ctx ->
+-                            // If not matched, the request was for an invalid endpoint
+-                            // Return a 404 instead of redirecting to the UI for usability
+-                            if (ctx.endpoints().lastHttpEndpoint()?.path == "*") {
+-                                throw NotFoundResponse()
++                            after { ctx ->
++                                // If not matched, the request was for an invalid endpoint
++                                // Return a 404 instead of redirecting to the UI for usability
++                                if (ctx.endpoints().lastHttpEndpoint()?.path == "*") {
++                                    throw NotFoundResponse()
++                                }
+                             }
+                         }
+                     }
+                 }
+ 
+-                config.events.serverStarted {
+-                    if (serverConfig.initialOpenInBrowserEnabled.value) {
+-                        scope.launch {
+-                            withTimeoutOrNull(10.seconds) {
+-                                WebInterfaceManager.isSetupComplete.first { it }
++                // GoManga: opening a desktop browser is meaningless on the iOS embed
++                // (and would block on WebInterfaceManager setup that slim mode never
++                // runs); skip this heavy startup side-effect in slim mode.
++                if (!slimMode) {
++                    config.events.serverStarted {
++                        if (serverConfig.initialOpenInBrowserEnabled.value) {
++                            scope.launch {
++                                withTimeoutOrNull(10.seconds) {
++                                    WebInterfaceManager.isSetupComplete.first { it }
++                                }
++                                Browser.openInBrowser()
+                             }
+-                            Browser.openInBrowser()
+                         }
+                     }
+                 }
+             }
+ 
+-        // when JVM is prompted to shutdown, stop javalin gracefully
+-        Runtime.getRuntime().addShutdownHook(
+-            thread(start = false) {
+-                app.stop()
+-            },
+-        )
++        // when JVM is prompted to shutdown, stop javalin gracefully. GoManga:
++        // install the process-scoped hook once and target the CURRENT app, so a
++        // restart (which replaces `currentApp`) doesn't pile up stale hooks.
++        currentApp = app
++        if (!shutdownHookInstalled) {
++            shutdownHookInstalled = true
++            Runtime.getRuntime().addShutdownHook(
++                thread(start = false) {
++                    currentApp?.stop()
++                },
++            )
++        }
+     }
+ 
+     fun RoutesConfig.defineCore() {
++        // GoManga: defineCore runs during config-building (before the app is
++        // started), so it cannot see javalinSetup's local `slimMode`; recompute it
++        // from the same system property the rest of the slim wiring reads.
++        val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
+         val loginPath = ServerSubpath.maybeAddAsPrefix("/login.html")
+ 
+-        get(loginPath) { ctx ->
+-            val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
+-            ctx.header("content-type", "text/html")
+-            val httpCacheSeconds = 1.days.inWholeSeconds
+-            ctx.header("cache-control", "max-age=$httpCacheSeconds")
+-            ctx.render(
+-                "Login.jte",
+-                mapOf(
+-                    "locale" to locale,
+-                    "error" to "",
+-                ),
+-            )
+-        }
+-
+-        post(loginPath) { ctx ->
+-            val username = ctx.formParam("user")
+-            val password = ctx.formParam("pass")
+-            val isValid =
+-                username == serverConfig.authUsername.value &&
+-                    password == serverConfig.authPassword.value
+-
+-            if (isValid) {
+-                val redirect = ctx.queryParam("redirect") ?: ServerSubpath.maybeAddAsPrefix("/")
+-                val uri = URI(redirect)
+-                if (uri.host != null || uri.scheme != null) {
+-                    throw IllegalArgumentException("Given redirect is not relative, refusing")
++        // ── GoManga slim-mode auth ──
++        // Stock auth lives in `beforeMatched`, which is what populates
++        // `Attribute.TachideskUser`. The slim `GET /api/v1/settings/about` handler
++        // (SettingsController.about) calls `getAttribute(TachideskUser).requireUser()`,
++        // and `getAttribute` is a non-null assertion (`attribute(name)!!`) — so if we
++        // simply dropped `beforeMatched` the about route would NPE on every request.
++        //
++        // We therefore DO NOT skip auth wiring entirely in slim mode. Instead we
++        // register a minimal `beforeMatched` that ONLY resolves + sets the user
++        // attributes (no SIMPLE_LOGIN redirect, no BASIC_AUTH 401 challenge, no
++        // login.html page routes — none of which the iOS embed uses). Because the
++        // embed runs with the default `authMode = NONE`, `getUserFromContext`
++        // returns `Admin(1)`, so `requireUser()` succeeds and `about` returns 200.
++        // This is a DELIBERATE narrowing: it is NOT a silent bypass of an enabled
++        // credential check — if a non-NONE authMode were ever set under slim mode,
++        // `getUserFromContext` would yield `Visitor` and the handler's own
++        // `requireUser()` would still 401. Non-slim auth below is unchanged.
++        if (slimMode) {
++            beforeMatched { ctx ->
++                ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
++                ctx.setAttribute(Attribute.TachideskBasic, false)
++            }
++            wsBefore {
++                it.onConnect { ctx ->
++                    ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
+                 }
+-                // NOTE: We currently have no session handler attached.
+-                // Thus, all sessions are stored in memory and not persisted.
+-                // Furthermore, default session timeout appears to be 30m
+-                ctx.header("Location", redirect)
+-                ctx.sessionAttribute("logged-in", username)
+-                throw RedirectResponse(HttpStatus.SEE_OTHER)
++            }
++        } else {
++            get(loginPath) { ctx ->
++                val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
++                ctx.header("content-type", "text/html")
++                val httpCacheSeconds = 1.days.inWholeSeconds
++                ctx.header("cache-control", "max-age=$httpCacheSeconds")
++                ctx.render(
++                    "Login.jte",
++                    mapOf(
++                        "locale" to locale,
++                        "error" to "",
++                    ),
++                )
+             }
+ 
+-            val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
+-            ctx.header("content-type", "text/html")
+-            ctx.req().session.invalidate()
+-            ctx.render(
+-                "Login.jte",
+-                mapOf(
+-                    "locale" to locale,
+-                    "error" to "Invalid username or password",
+-                ),
+-            )
+-        }
++            post(loginPath) { ctx ->
++                val username = ctx.formParam("user")
++                val password = ctx.formParam("pass")
++                val isValid =
++                    username == serverConfig.authUsername.value &&
++                        password == serverConfig.authPassword.value
++
++                if (isValid) {
++                    val redirect = ctx.queryParam("redirect") ?: ServerSubpath.maybeAddAsPrefix("/")
++                    val uri = URI(redirect)
++                    if (uri.host != null || uri.scheme != null) {
++                        throw IllegalArgumentException("Given redirect is not relative, refusing")
++                    }
++                    // NOTE: We currently have no session handler attached.
++                    // Thus, all sessions are stored in memory and not persisted.
++                    // Furthermore, default session timeout appears to be 30m
++                    ctx.header("Location", redirect)
++                    ctx.sessionAttribute("logged-in", username)
++                    throw RedirectResponse(HttpStatus.SEE_OTHER)
++                }
+ 
+-        beforeMatched { ctx ->
+-            val isWebManifest =
+-                listOf("site.webmanifest", "manifest.json", "login.html").any { ctx.path().endsWith(it) }
+-            val isPageIcon =
+-                ctx.path().startsWith('/') &&
+-                    !ctx.path().substring(1).contains('/') &&
+-                    listOf(".png", ".jpg", ".ico").any { ctx.path().endsWith(it) }
+-            val isPreFlight = ctx.method() == HandlerType.OPTIONS
+-            val isApi = ctx.path().startsWith(ServerSubpath.maybeAddAsPrefix("/api/"))
+-
+-            val requiresAuthentication = !isPreFlight && !isPageIcon && !isWebManifest
+-            if (!requiresAuthentication) {
+-                return@beforeMatched
++                val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
++                ctx.header("content-type", "text/html")
++                ctx.req().session.invalidate()
++                ctx.render(
++                    "Login.jte",
++                    mapOf(
++                        "locale" to locale,
++                        "error" to "Invalid username or password",
++                    ),
++                )
+             }
+ 
+-            val authMode = serverConfig.authMode.value
++            beforeMatched { ctx ->
++                val isWebManifest =
++                    listOf("site.webmanifest", "manifest.json", "login.html").any { ctx.path().endsWith(it) }
++                val isPageIcon =
++                    ctx.path().startsWith('/') &&
++                        !ctx.path().substring(1).contains('/') &&
++                        listOf(".png", ".jpg", ".ico").any { ctx.path().endsWith(it) }
++                val isPreFlight = ctx.method() == HandlerType.OPTIONS
++                val isApi = ctx.path().startsWith(ServerSubpath.maybeAddAsPrefix("/api/"))
++
++                val requiresAuthentication = !isPreFlight && !isPageIcon && !isWebManifest
++                if (!requiresAuthentication) {
++                    return@beforeMatched
++                }
+ 
+-            fun credentialsValid(): Boolean {
+-                val basicAuthCredentials = ctx.basicAuthCredentials() ?: return false
+-                val (username, password) = basicAuthCredentials
+-                return username == serverConfig.authUsername.value &&
+-                    password == serverConfig.authPassword.value
+-            }
++                val authMode = serverConfig.authMode.value
+ 
+-            fun cookieValid(): Boolean {
+-                val username = ctx.sessionAttribute<String>("logged-in") ?: return false
+-                return username == serverConfig.authUsername.value
+-            }
++                fun credentialsValid(): Boolean {
++                    val basicAuthCredentials = ctx.basicAuthCredentials() ?: return false
++                    val (username, password) = basicAuthCredentials
++                    return username == serverConfig.authUsername.value &&
++                        password == serverConfig.authPassword.value
++                }
+ 
+-            if (authMode == AuthMode.SIMPLE_LOGIN && !cookieValid() && !isApi) {
+-                val url =
+-                    "$loginPath?redirect=" + URLEncoder.encode(ctx.path() + (ctx.queryString()?.let { "?" + it } ?: ""), Charsets.UTF_8)
+-                ctx.header("Location", url)
+-                throw RedirectResponse(HttpStatus.SEE_OTHER)
+-            }
++                fun cookieValid(): Boolean {
++                    val username = ctx.sessionAttribute<String>("logged-in") ?: return false
++                    return username == serverConfig.authUsername.value
++                }
+ 
+-            if (authMode == AuthMode.BASIC_AUTH && !credentialsValid()) {
+-                ctx.header("WWW-Authenticate", "Basic")
+-                throw UnauthorizedResponse()
+-            }
++                if (authMode == AuthMode.SIMPLE_LOGIN && !cookieValid() && !isApi) {
++                    val url =
++                        "$loginPath?redirect=" + URLEncoder.encode(ctx.path() + (ctx.queryString()?.let { "?" + it } ?: ""), Charsets.UTF_8)
++                    ctx.header("Location", url)
++                    throw RedirectResponse(HttpStatus.SEE_OTHER)
++                }
+ 
+-            ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
+-            ctx.setAttribute(Attribute.TachideskBasic, credentialsValid())
+-        }
++                if (authMode == AuthMode.BASIC_AUTH && !credentialsValid()) {
++                    ctx.header("WWW-Authenticate", "Basic")
++                    throw UnauthorizedResponse()
++                }
+ 
+-        wsBefore {
+-            it.onConnect { ctx ->
+-                ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
++                ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
++                ctx.setAttribute(Attribute.TachideskBasic, credentialsValid())
+             }
+-        }
++
++            wsBefore {
++                it.onConnect { ctx ->
++                    ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
++                }
++            }
++        } // end !slimMode auth/login/ws wiring
+ 
+         exception(NullPointerException::class.java) { e, ctx ->
+             logger.error(e) { "NullPointerException while handling the request" }
+@@ -287,6 +378,83 @@ object JavalinSetup {
+         }
+     }
+ 
++    /**
++     * GoManga: restart ONLY the embedded HTTP server (Javalin + its Jetty
++     * connector) inside the already-running JVM, re-binding the same port.
++     *
++     * The SDK calls this over JNI when the host app detects the loopback REST
++     * listener has died — e.g. after an iOS background freeze→thaw left Jetty's
++     * NIO acceptor in a dead state — because the OpenJ9 JVM is a per-process
++     * singleton that cannot be re-created in-process (otherwise the user must
++     * kill the app). It stops the previous Javalin app (releasing the port) and
++     * re-runs [javalinSetup] on a fresh `Server`; it deliberately does NOT touch
++     * the DB, Koin/DI modules, or the source/extension runtime, which stay live
++     * from the original boot. Returns once the new listener is up; throws if the
++     * rebind fails, which the SDK surfaces to the host.
++     *
++     * Invoked from the native layer (`gomanga_jvm_restart_suwayomi`) on a freshly
++     * attached thread; never call it concurrently with itself.
++     */
++    @JvmStatic
++    fun gomangaRestartHttpServer() {
++        logger.info { "GoManga: restarting embedded HTTP server (in-JVM)…" }
++        withAppClassLoader {
++            stopCurrentApp()
++            javalinSetup()
++        }
++        logger.info { "GoManga: embedded HTTP server restarted" }
++    }
++
++    /**
++     * GoManga: STOP the embedded HTTP server (Javalin/Jetty) inside the running
++     * JVM WITHOUT restarting it, releasing the listener + Jetty threads + the
++     * loopback port. The host calls this when it proactively pauses source work
++     * for a long iOS background: a stopped HTTP layer means a much smaller
++     * background footprint (lower jetsam risk) AND no live NIO acceptor for an
++     * iOS freeze→thaw to corrupt — so [gomangaRestartHttpServer] on return is a
++     * clean rebind. The DB/Koin/source runtime stay live from the original boot.
++     */
++    @JvmStatic
++    fun gomangaStopHttpServer() {
++        logger.info { "GoManga: stopping embedded HTTP server (in-JVM)…" }
++        withAppClassLoader {
++            stopCurrentApp()
++        }
++        logger.info { "GoManga: embedded HTTP server stopped" }
++    }
++
++    /**
++     * Run [block] with the thread context classloader pinned to the application
++     * loader. The native stop/restart entries arrive on a freshly JNI-attached
++     * thread whose context classloader is the system loader, NOT the loader that
++     * loaded the Suwayomi fat jar. Jetty/Javalin resolve servlet + WebSocket
++     * factory classes (e.g. WebSocketServerFactory) through the THREAD CONTEXT
++     * classloader during app.start(); without this they throw
++     * ClassNotFoundException — even though the same classes loaded fine on the
++     * original boot, which ran on the primordial thread.
++     */
++    private fun withAppClassLoader(block: () -> Unit) {
++        val thread = Thread.currentThread()
++        val previousClassLoader = thread.contextClassLoader
++        thread.contextClassLoader = JavalinSetup::class.java.classLoader
++        try {
++            block()
++        } finally {
++            thread.contextClassLoader = previousClassLoader
++        }
++    }
++
++    /** Stop + clear the current Javalin app. A dead Jetty can throw on stop; the
++     *  caller proceeds regardless (a fresh server is created on the next start). */
++    private fun stopCurrentApp() {
++        try {
++            currentApp?.stop()
++        } catch (e: Throwable) {
++            logger.warn(e) { "GoManga: ignoring error while stopping Javalin" }
++        }
++        currentApp = null
++    }
++
+     // private fun getOpenApiOptions(): OpenApiOptions {
+     //     val applicationInfo =
+     //         Info().apply {
+diff --git a/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt b/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
+index ea77725a..9c496591 100644
+--- a/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
++++ b/server/src/main/kotlin/suwayomi/tachidesk/server/ServerSetup.kt
+@@ -45,6 +45,7 @@ import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
+ import suwayomi.tachidesk.manga.impl.update.IUpdater
+ import suwayomi.tachidesk.manga.impl.update.Updater
+ import suwayomi.tachidesk.manga.impl.util.lang.renameTo
++import suwayomi.tachidesk.server.database.DBManager
+ import suwayomi.tachidesk.server.database.databaseUp
+ import suwayomi.tachidesk.server.generated.BuildConfig
+ import suwayomi.tachidesk.server.settings.SettingsRegistry
+@@ -72,6 +73,7 @@ import java.net.Authenticator
+ import java.net.PasswordAuthentication
+ import java.security.Security
+ import java.util.Locale
++import kotlin.concurrent.thread
+ 
+ private val logger = KotlinLogging.logger {}
+ 
+@@ -238,31 +240,44 @@ fun applicationSetup() {
+ 
+     // Application dirs
+     val applicationDirs = ApplicationDirs()
++    // ── GoManga slim-mode ──
++    // The iOS GoManga app uses Suwayomi only as an extension parser host.
++    // The flag is read early so startup-only desktop/server guards can be
++    // skipped before they spend time on file loggers, loopback probes, or
++    // migration scans.
++    val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
++
++    if (!slimMode) {
++        initLoggerConfig(
++            applicationDirs.dataRoot,
++            serverConfig.maxLogFiles.value,
++            serverConfig.maxLogFileSize.value,
++            serverConfig.maxLogFolderSize.value,
++        )
+ 
+-    initLoggerConfig(
+-        applicationDirs.dataRoot,
+-        serverConfig.maxLogFiles.value,
+-        serverConfig.maxLogFileSize.value,
+-        serverConfig.maxLogFolderSize.value,
+-    )
+-
+-    serverConfig.subscribeTo(
+-        combine(
+-            serverConfig.maxLogFiles,
+-            serverConfig.maxLogFileSize,
+-            serverConfig.maxLogFolderSize,
+-        ) { maxLogFiles, maxLogFileSize, maxLogFolderSize ->
+-            Triple(maxLogFiles, maxLogFileSize, maxLogFolderSize)
+-        }.distinctUntilChanged(),
+-        { (maxLogFiles, maxLogFileSize, maxLogFolderSize) ->
+-            logger.debug {
+-                "updateFileAppender: maxLogFiles= $maxLogFiles, maxLogFileSize= $maxLogFileSize, maxLogFolderSize= $maxLogFolderSize"
+-            }
+-            updateFileAppender(maxLogFiles, maxLogFileSize, maxLogFolderSize)
+-        },
+-    )
++        serverConfig.subscribeTo(
++            combine(
++                serverConfig.maxLogFiles,
++                serverConfig.maxLogFileSize,
++                serverConfig.maxLogFolderSize,
++            ) { maxLogFiles, maxLogFileSize, maxLogFolderSize ->
++                Triple(maxLogFiles, maxLogFileSize, maxLogFolderSize)
++            }.distinctUntilChanged(),
++            { (maxLogFiles, maxLogFileSize, maxLogFolderSize) ->
++                logger.debug {
++                    "updateFileAppender: maxLogFiles= $maxLogFiles, maxLogFileSize= $maxLogFileSize, maxLogFolderSize= $maxLogFolderSize"
++                }
++                updateFileAppender(maxLogFiles, maxLogFileSize, maxLogFolderSize)
++            },
++        )
+ 
+-    setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
++        setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
++    } else {
++        setLogLevelFor(BASE_LOGGER_NAME, Level.WARN)
++        setLogLevelFor("Exposed", Level.ERROR)
++        setLogLevelFor("graphql", Level.WARN)
++        setLogLevelFor("notprivacysafe", Level.WARN)
++    }
+ 
+     logger.info { "Running Suwayomi-Server ${BuildConfig.VERSION}" }
+ 
+@@ -281,20 +296,32 @@ fun applicationSetup() {
+ 
+     logger.debug { "Data Root directory is set to: ${applicationDirs.dataRoot}" }
+ 
+-    // Migrate Directories from old versions
+-    File("$ApplicationRootDir/manga-thumbnails").renameTo(applicationDirs.tempThumbnailCacheRoot)
+-    File("$ApplicationRootDir/manga-local").renameTo(applicationDirs.localMangaRoot)
+-    File("$ApplicationRootDir/anime-thumbnails").delete()
+-
+-    // make dirs we need
+-    listOf(
+-        applicationDirs.dataRoot,
+-        applicationDirs.extensionsRoot,
+-        applicationDirs.extensionsRoot + "/icon",
+-        applicationDirs.tempThumbnailCacheRoot,
+-        applicationDirs.downloadsRoot,
+-        applicationDirs.localMangaRoot,
+-    ).forEach { File(it).mkdirs() }
++    if (slimMode) {
++        thread(start = true, isDaemon = true, name = "gomanga-bouncycastle-init") {
++            Thread.sleep(2_000)
++            Security.addProvider(BouncyCastleProvider())
++            logger.info { "GoManga slim-mode: BouncyCastle provider registered in background" }
++        }
++    }
++
++    if (!slimMode) {
++        // Migrate Directories from old versions
++        File("$ApplicationRootDir/manga-thumbnails").renameTo(applicationDirs.tempThumbnailCacheRoot)
++        File("$ApplicationRootDir/manga-local").renameTo(applicationDirs.localMangaRoot)
++        File("$ApplicationRootDir/anime-thumbnails").delete()
++
++        // make dirs we need
++        listOf(
++            applicationDirs.dataRoot,
++            applicationDirs.extensionsRoot,
++            applicationDirs.extensionsRoot + "/icon",
++            applicationDirs.tempThumbnailCacheRoot,
++            applicationDirs.downloadsRoot,
++            applicationDirs.localMangaRoot,
++        ).forEach { File(it).mkdirs() }
++    } else {
++        logger.info { "GoManga slim-mode: skipping startup directory migration/materialization" }
++    }
+ 
+     // initialize Koin modules
+     val app = App()
+@@ -335,7 +362,11 @@ fun applicationSetup() {
+     }
+ 
+     // Make sure only one instance of the app is running
+-    handleAppMutex()
++    if (!slimMode) {
++        handleAppMutex()
++    } else {
++        logger.info { "GoManga slim-mode: skipping AppMutex self-probe" }
++    }
+ 
+     // Load Android compatibility dependencies
+     AndroidCompatInitializer().init()
+@@ -349,33 +380,41 @@ fun applicationSetup() {
+         .onEach { System.setProperty("http.agent", it) }
+         .launchIn(GlobalScope)
+ 
+-    // create or update conf file if doesn't exist
+-    try {
+-        val dataConfFile = File("${applicationDirs.dataRoot}/server.conf")
+-        if (!dataConfFile.exists()) {
+-            JavalinSetup::class.java.getResourceAsStream("/server-reference.conf").use { input ->
+-                dataConfFile.outputStream().use { output -> input.copyTo(output) }
++    if (!slimMode) {
++        // create or update conf file if doesn't exist
++        try {
++            val dataConfFile = File("${applicationDirs.dataRoot}/server.conf")
++            if (!dataConfFile.exists()) {
++                JavalinSetup::class.java.getResourceAsStream("/server-reference.conf").use { input ->
++                    dataConfFile.outputStream().use { output -> input.copyTo(output) }
++                }
++            } else {
++                // make sure the user config file is up-to-date
++                GlobalConfigManager.updateUserConfig { migrateConfig(this, it) }
+             }
+-        } else {
+-            // make sure the user config file is up-to-date
+-            GlobalConfigManager.updateUserConfig { migrateConfig(this, it) }
++        } catch (e: Exception) {
++            logger.error(e) { "Exception while creating initial server.conf" }
++            shutdownApp(ExitCode.SetupConfFileFailed)
+         }
+-    } catch (e: Exception) {
+-        logger.error(e) { "Exception while creating initial server.conf" }
+-        shutdownApp(ExitCode.SetupConfFileFailed)
++    } else {
++        logger.info { "GoManga slim-mode: skipping server.conf materialization" }
+     }
+ 
+-    // copy local source icon
+-    try {
+-        val localSourceIconFile = File("${applicationDirs.extensionsRoot}/icon/localSource.png")
+-        if (!localSourceIconFile.exists()) {
+-            JavalinSetup::class.java.getResourceAsStream("/icon/localSource.png").use { input ->
+-                localSourceIconFile.outputStream().use { output -> input.copyTo(output) }
++    if (!slimMode) {
++        // copy local source icon
++        try {
++            val localSourceIconFile = File("${applicationDirs.extensionsRoot}/icon/localSource.png")
++            if (!localSourceIconFile.exists()) {
++                JavalinSetup::class.java.getResourceAsStream("/icon/localSource.png").use { input ->
++                    localSourceIconFile.outputStream().use { output -> input.copyTo(output) }
++                }
+             }
++        } catch (e: Exception) {
++            logger.error(e) { "Exception while copying Local source's icon" }
++            shutdownApp(ExitCode.LocalSourceIconCopyFailure)
+         }
+-    } catch (e: Exception) {
+-        logger.error(e) { "Exception while copying Local source's icon" }
+-        shutdownApp(ExitCode.LocalSourceIconCopyFailure)
++    } else {
++        logger.info { "GoManga slim-mode: skipping local source icon materialization" }
+     }
+ 
+     // fixes #119 , ref:
+@@ -383,15 +422,33 @@ fun applicationSetup() {
+     // calculation depends on String.lowercase()
+     Locale.setDefault(Locale.ENGLISH)
+ 
+-    // Initialize the localization service
+-    LocalizationHelper.initialize()
+-    logger.debug {
+-        "Localization service initialized. Supported languages: ${LocalizationHelper.getSupportedLocales()}"
++    if (!slimMode) {
++        // Initialize the localization service
++        LocalizationHelper.initialize()
++        logger.debug {
++            "Localization service initialized. Supported languages: ${LocalizationHelper.getSupportedLocales()}"
++        }
++    } else {
++        logger.info { "GoManga slim-mode: skipping localization service initialization" }
+     }
+ 
+-    runMigrations(applicationDirs)
++    // v2.3 reordered runMigrations before databaseUp. Keep that order; slim-mode
++    // ships an already-migrated seed DB so both startup migration paths are skipped.
++    if (!slimMode) {
++        runMigrations(applicationDirs)
++    } else {
++        logger.info { "GoManga slim-mode: skipping legacy preference/download migrations" }
++    }
+ 
+-    databaseUp()
++    if (!slimMode) {
++        databaseUp()
++    } else {
++        // The shipped GoManga seed DB is already migrated for this pinned
++        // Suwayomi schema. Connect (H2) so Exposed has a default DB, but avoid
++        // scanning and executing the migration classes on every app start.
++        logger.info { "GoManga slim-mode: connecting database without startup migration scan" }
++        DBManager.setupDatabase()
++    }
+ 
+     try {
+         LocalSource.register()
+@@ -400,132 +457,161 @@ fun applicationSetup() {
+         shutdownApp(ExitCode.LocalSourceSetupFailure)
+     }
+ 
+-    serverConfig.subscribeTo(
+-        combine<Any, DatabaseSettings>(
+-            serverConfig.databaseType,
+-            serverConfig.databaseUrl,
+-            serverConfig.databaseUsername,
+-            serverConfig.databasePassword,
+-            serverConfig.useHikariConnectionPool,
+-        ) { vargs ->
+-            DatabaseSettings(
+-                vargs[0] as DatabaseType,
+-                vargs[1] as String,
+-                vargs[2] as String,
+-                vargs[3] as String,
+-                vargs[4] as Boolean,
+-            )
+-        }.distinctUntilChanged(),
+-        { (databaseType, databaseUrl, _databaseUsername, _databasePassword, hikariCp) ->
+-            logger.info {
+-                "Database changed - type=$databaseType url=$databaseUrl, username=[REDACTED], password=[REDACTED], hikaricp=$hikariCp"
+-            }
+-            databaseUp()
++    if (!slimMode) {
++        serverConfig.subscribeTo(
++            combine<Any, DatabaseSettings>(
++                serverConfig.databaseType,
++                serverConfig.databaseUrl,
++                serverConfig.databaseUsername,
++                serverConfig.databasePassword,
++                serverConfig.useHikariConnectionPool,
++            ) { vargs ->
++                DatabaseSettings(
++                    vargs[0] as DatabaseType,
++                    vargs[1] as String,
++                    vargs[2] as String,
++                    vargs[3] as String,
++                    vargs[4] as Boolean,
++                )
++            }.distinctUntilChanged(),
++            { (databaseType, databaseUrl, _databaseUsername, _databasePassword, hikariCp) ->
++                logger.info {
++                    "Database changed - type=$databaseType url=$databaseUrl, username=[REDACTED], password=[REDACTED], hikaricp=$hikariCp"
++                }
++                databaseUp()
+ 
+-            LocalSource.register()
+-        },
+-        ignoreInitialValue = true,
+-    )
++                LocalSource.register()
++            },
++            ignoreInitialValue = true,
++        )
+ 
+-    // create system tray
+-    serverConfig.subscribeTo(
+-        serverConfig.systemTrayEnabled,
+-        { systemTrayEnabled ->
+-            try {
+-                if (systemTrayEnabled) {
+-                    SystemTray.create()
+-                } else {
+-                    SystemTray.remove()
++        // create system tray
++        serverConfig.subscribeTo(
++            serverConfig.systemTrayEnabled,
++            { systemTrayEnabled ->
++                try {
++                    if (systemTrayEnabled) {
++                        SystemTray.create()
++                    } else {
++                        SystemTray.remove()
++                    }
++                } catch (e: Throwable) {
++                    // cover both java.lang.Exception and java.lang.Error
++                    logger.error(e) { "Failed to create/remove SystemTray due to" }
+                 }
+-            } catch (e: Throwable) {
+-                // cover both java.lang.Exception and java.lang.Error
+-                logger.error(e) { "Failed to create/remove SystemTray due to" }
+-            }
+-        },
+-        ignoreInitialValue = false,
+-    )
++            },
++            ignoreInitialValue = false,
++        )
++    }
+ 
+     setLogLevelFor("org.eclipse.jetty", Level.OFF)
+     setLogLevelFor("com.zaxxer.hikari", Level.WARN)
+ 
+-    // socks proxy settings
+-    serverConfig.subscribeTo(
+-        combine<Any, ProxySettings>(
+-            serverConfig.socksProxyEnabled,
+-            serverConfig.socksProxyVersion,
+-            serverConfig.socksProxyHost,
+-            serverConfig.socksProxyPort,
+-            serverConfig.socksProxyUsername,
+-            serverConfig.socksProxyPassword,
+-        ) { vargs ->
+-            ProxySettings(
+-                vargs[0] as Boolean,
+-                vargs[1] as Int,
+-                vargs[2] as String,
+-                vargs[3] as String,
+-                vargs[4] as String,
+-                vargs[5] as String,
+-            )
+-        }.distinctUntilChanged(),
+-        { (proxyEnabled, proxyVersion, proxyHost, proxyPort, proxyUsername, proxyPassword) ->
+-            logger.info {
+-                "Socks Proxy changed - enabled=$proxyEnabled address=$proxyHost:$proxyPort , username=[REDACTED], password=[REDACTED]"
+-            }
+-            if (proxyEnabled) {
+-                System.setProperty("socksProxyHost", proxyHost)
+-                System.setProperty("socksProxyPort", proxyPort)
+-                System.setProperty("socksProxyVersion", proxyVersion.toString())
+-
+-                Authenticator.setDefault(
+-                    object : Authenticator() {
+-                        override fun getPasswordAuthentication(): PasswordAuthentication? {
+-                            if (requestingProtocol.startsWith("SOCKS", ignoreCase = true)) {
+-                                return PasswordAuthentication(
+-                                    proxyUsername,
+-                                    proxyPassword.toCharArray(),
+-                                )
++    if (!slimMode) {
++        // socks proxy settings
++        serverConfig.subscribeTo(
++            combine<Any, ProxySettings>(
++                serverConfig.socksProxyEnabled,
++                serverConfig.socksProxyVersion,
++                serverConfig.socksProxyHost,
++                serverConfig.socksProxyPort,
++                serverConfig.socksProxyUsername,
++                serverConfig.socksProxyPassword,
++            ) { vargs ->
++                ProxySettings(
++                    vargs[0] as Boolean,
++                    vargs[1] as Int,
++                    vargs[2] as String,
++                    vargs[3] as String,
++                    vargs[4] as String,
++                    vargs[5] as String,
++                )
++            }.distinctUntilChanged(),
++            { (proxyEnabled, proxyVersion, proxyHost, proxyPort, proxyUsername, proxyPassword) ->
++                logger.info {
++                    "Socks Proxy changed - enabled=$proxyEnabled address=$proxyHost:$proxyPort , username=[REDACTED], password=[REDACTED]"
++                }
++                if (proxyEnabled) {
++                    System.setProperty("socksProxyHost", proxyHost)
++                    System.setProperty("socksProxyPort", proxyPort)
++                    System.setProperty("socksProxyVersion", proxyVersion.toString())
++
++                    Authenticator.setDefault(
++                        object : Authenticator() {
++                            override fun getPasswordAuthentication(): PasswordAuthentication? {
++                                if (requestingProtocol.startsWith("SOCKS", ignoreCase = true)) {
++                                    return PasswordAuthentication(
++                                        proxyUsername,
++                                        proxyPassword.toCharArray(),
++                                    )
++                                }
++
++                                return null
+                             }
++                        },
++                    )
++                } else {
++                    System.clearProperty("socksProxyHost")
++                    System.clearProperty("socksProxyPort")
++                    System.clearProperty("socksProxyVersion")
+ 
+-                            return null
+-                        }
+-                    },
+-                )
+-            } else {
+-                System.clearProperty("socksProxyHost")
+-                System.clearProperty("socksProxyPort")
+-                System.clearProperty("socksProxyVersion")
++                    Authenticator.setDefault(null)
++                }
++            },
++            ignoreInitialValue = false,
++        )
++    }
+ 
+-                Authenticator.setDefault(null)
+-            }
+-        },
+-        ignoreInitialValue = false,
+-    )
++    // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga.
++    // Extensions need it. In GoManga slim-mode it is registered by the early
++    // background thread above so it does not block loopback listener startup.
++    if (!slimMode) {
++        Security.addProvider(BouncyCastleProvider())
++    }
+ 
+-    // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga
+-    Security.addProvider(BouncyCastleProvider())
++    if (!slimMode) {
++        // start automated global updates
++        val updater = Injekt.get<IUpdater>()
++        (updater as Updater).scheduleUpdateTask()
+ 
+-    // start automated global updates
+-    val updater = Injekt.get<IUpdater>()
+-    (updater as Updater).scheduleUpdateTask()
++        // start automated backups
++        ProtoBackupExport.scheduleAutomatedBackupTask()
+ 
+-    // start automated backups
+-    ProtoBackupExport.scheduleAutomatedBackupTask()
++        // start DownloadManager and restore + resume downloads
++        DownloadManager.restoreAndResumeDownloads()
+ 
+-    // start DownloadManager and restore + resume downloads
+-    DownloadManager.restoreAndResumeDownloads()
++        // v2.3 side-effect: schedule the sync task
++        SyncManager.scheduleSyncTask()
+ 
+-    SyncManager.scheduleSyncTask()
++        // asynchronously initialize CEF (native Chromium)
++        GlobalScope.launch {
++            CEFManager.init()
++        }
+ 
+-    // asynchronously initialize CEF
+-    GlobalScope.launch {
+-        CEFManager.init()
++        // v2.3 side-effect: keep extension-store prefs mirrored into the DB
++        serverConfig.subscribeTo(
++            serverConfig.extensionStores,
++            { _ ->
++                ExtensionStoreService.syncPrefsToDb()
++            },
++            ignoreInitialValue = false,
++        )
++    } else {
++        // [GoManga slim-mode] Skip every heavy desktop/server startup side-effect:
++        // SystemTray, SocksProxy, Updater, AutomatedBackups,
++        // DownloadManager.restoreAndResume, and v2.3's new SyncManager schedule +
++        // ExtensionStore prefs->db sync subscription.
++        //
++        // [KCEF/JCEF no-op] CEFManager.init() (native Chromium) is intentionally
++        // NOT called on the GoManga iOS runtime. In the on-Mac OpenJ9 -Xint boot
++        // test the native CefApp init crashed with a SIGSEGV that the onError
++        // handler does NOT catch, taking down the JVM ~14s AFTER Javalin was
++        // already listening. iOS has no native Chromium at all, so this eager init
++        // must never run on the embedded runtime. The no-op is expressed by
++        // skipping CEFManager.init() here rather than editing CEFManager.kt.
++        logger.info {
++            "GoManga slim-mode: skipping SystemTray, SocksProxy, Updater, AutomatedBackups, " +
++                "DownloadManager.restoreAndResume, SyncManager, ExtensionStore sync, and CEF init"
++        }
+     }
+-
+-    serverConfig.subscribeTo(
+-        serverConfig.extensionStores,
+-        { _ ->
+-            ExtensionStoreService.syncPrefsToDb()
+-        },
+-        ignoreInitialValue = false,
+-    )
+ }
+diff --git a/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt b/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt
+new file mode 100644
+index 00000000..4a946990
+--- /dev/null
++++ b/server/src/test/kotlin/eu/kanade/tachiyomi/network/interceptor/CleartextGuardInterceptorTest.kt
+@@ -0,0 +1,121 @@
++package eu.kanade.tachiyomi.network.interceptor
++
++import okhttp3.Call
++import okhttp3.Connection
++import okhttp3.Handshake
++import okhttp3.Interceptor
++import okhttp3.Protocol
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.toResponseBody
++import okhttp3.Route
++import java.io.IOException
++import java.net.Socket
++import java.util.concurrent.TimeUnit
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFailsWith
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++/**
++ * GoMangaInsecureHttpGate contract. No network / MockWebServer — a hand-rolled
++ * fake Chain exercises the interceptor's branching directly:
++ *  - application invocation (connection == null): a blocked cleartext request
++ *    short-circuits to 496 WITHOUT calling proceed (no socket).
++ *  - network invocation (connection != null): a blocked hop THROWS.
++ *  - https / loopback / policy-ON: pure passthrough (proceed called once).
++ *
++ * Run manually: ./gradlew :server:test --tests "*CleartextGuardInterceptor*"
++ */
++class CleartextGuardInterceptorTest {
++
++    private fun req(url: String) = Request.Builder().url(url).build()
++
++    // A fake Chain that records whether proceed() ran and returns a canned 200.
++    private class FakeChain(
++        private val request: Request,
++        private val connected: Boolean,
++    ) : Interceptor.Chain {
++        var proceedCalled = false
++            private set
++
++        override fun request(): Request = request
++
++        override fun proceed(request: Request): Response {
++            proceedCalled = true
++            return Response.Builder()
++                .request(request)
++                .protocol(Protocol.HTTP_1_1)
++                .code(200)
++                .message("OK")
++                .body("ok".toResponseBody(null))
++                .build()
++        }
++
++        override fun connection(): Connection? = if (connected) StubConnection else null
++
++        override fun call(): Call = throw NotImplementedError()
++        override fun connectTimeoutMillis(): Int = 0
++        override fun readTimeoutMillis(): Int = 0
++        override fun writeTimeoutMillis(): Int = 0
++        override fun withConnectTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
++        override fun withReadTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
++        override fun withWriteTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain = this
++    }
++
++    private object StubConnection : Connection {
++        override fun route(): Route = throw NotImplementedError()
++        override fun socket(): Socket = throw NotImplementedError()
++        override fun handshake(): Handshake? = null
++        override fun protocol(): Protocol = Protocol.HTTP_1_1
++    }
++
++    private fun gate(allow: Boolean) = CleartextGuardInterceptor { allow }
++
++    @Test
++    fun `policy off - application-path cleartext http short-circuits to 496 without connecting`() {
++        val chain = FakeChain(req("http://cdn.example.com/p.jpg"), connected = false)
++        val response = gate(allow = false).intercept(chain)
++        assertEquals(CleartextGuardInterceptor.INSECURE_BLOCKED_CODE, response.code)
++        assertEquals("1", response.header("X-GoManga-Insecure-Blocked"))
++        assertFalse(chain.proceedCalled, "must not dial out for a blocked request")
++    }
++
++    @Test
++    fun `policy off - network-path cleartext http hop throws`() {
++        val chain = FakeChain(req("http://cdn.example.com/p.jpg"), connected = true)
++        assertFailsWith<IOException> { gate(allow = false).intercept(chain) }
++        assertFalse(chain.proceedCalled, "the downgraded hop is refused")
++    }
++
++    @Test
++    fun `policy off - https is always allowed (both invocations)`() {
++        for (connected in listOf(false, true)) {
++            val chain = FakeChain(req("https://cdn.example.com/p.jpg"), connected)
++            val response = gate(allow = false).intercept(chain)
++            assertEquals(200, response.code)
++            assertTrue(chain.proceedCalled)
++        }
++    }
++
++    @Test
++    fun `policy off - loopback cleartext is exempt (embedded server, CF proxy)`() {
++        for (host in listOf("127.0.0.1", "localhost")) {
++            val chain = FakeChain(req("http://$host:4571/api/v1/x"), connected = false)
++            val response = gate(allow = false).intercept(chain)
++            assertEquals(200, response.code)
++            assertTrue(chain.proceedCalled)
++        }
++    }
++
++    @Test
++    fun `policy on - cleartext http is a pure no-op (both invocations)`() {
++        for (connected in listOf(false, true)) {
++            val chain = FakeChain(req("http://cdn.example.com/p.jpg"), connected)
++            val response = gate(allow = true).intercept(chain)
++            assertEquals(200, response.code)
++            assertTrue(chain.proceedCalled, "ON must proceed unconditionally — no synthetic response, no throw")
++        }
++    }
++}

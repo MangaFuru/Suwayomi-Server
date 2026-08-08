@@ -16,6 +16,7 @@ import io.javalin.apibuilder.ApiBuilder.post
 import io.javalin.apibuilder.ApiBuilder.put
 import io.javalin.apibuilder.ApiBuilder.ws
 import suwayomi.tachidesk.manga.controller.BackupController
+import suwayomi.tachidesk.manga.controller.BuiltInKomgaController
 import suwayomi.tachidesk.manga.controller.CategoryController
 import suwayomi.tachidesk.manga.controller.DownloadController
 import suwayomi.tachidesk.manga.controller.ExtensionController
@@ -26,6 +27,11 @@ import suwayomi.tachidesk.manga.controller.UpdateController
 
 object MangaAPI {
     fun defineEndpoints() {
+        if (System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true") {
+            defineGoMangaEndpoints()
+            return
+        }
+
         path("extension") {
             get("list", ExtensionController.list)
 
@@ -78,6 +84,7 @@ object MangaAPI {
 
             patch("{mangaId}/chapter/{chapterIndex}/meta", MangaController.chapterMeta)
 
+            get("{mangaId}/chapter/{chapterIndex}/pages", MangaController.pageResourceList)
             get("{mangaId}/chapter/{chapterIndex}/page/{index}", MangaController.pageRetrieve)
         }
 
@@ -145,6 +152,58 @@ object MangaAPI {
             post("bind", TrackController.bind)
             post("update", TrackController.update)
             get("{trackerId}/thumbnail", TrackController.thumbnail)
+        }
+    }
+
+    private fun defineGoMangaEndpoints() {
+        path("extension") {
+            get("list", ExtensionController.list)
+            post("install", ExtensionController.installFile)
+            get("uninstall/{pkgName}", ExtensionController.uninstall)
+            get("icon/{apkName}", ExtensionController.icon)
+        }
+
+        path("source") {
+            get("list", SourceController.list)
+            get("{sourceId}", SourceController.retrieve)
+            get("{sourceId}/popular/{pageNum}", SourceController.popular)
+            get("{sourceId}/latest/{pageNum}", SourceController.latest)
+            get("{sourceId}/preferences", SourceController.getPreferences)
+            post("{sourceId}/preferences", SourceController.setPreference)
+            get("{sourceId}/filters", SourceController.getFilters)
+            post("{sourceId}/filters", SourceController.setFilters)
+            get("{sourceId}/search", SourceController.searchSingle)
+            post("{sourceId}/quick-search", SourceController.quickSearchSingle)
+            // GoManga no-DB source-URL addressing (source-token-addressing):
+            // detail / chapter-list / page-list by the REAL source URL, no H2.
+            get("{sourceId}/manga/details", MangaController.mangaDetailByUrl)
+            get("{sourceId}/manga/chapters", MangaController.chapterListByUrl)
+            get("{sourceId}/manga/chapter/pages", MangaController.pageResourceListByUrl)
+            get("{sourceId}/manga/chapter/page-image", MangaController.pageImageByUrl)
+        }
+
+        path("manga") {
+            get("{mangaId}", MangaController.retrieve)
+            get("{mangaId}/full", MangaController.retrieveFull)
+            get("{mangaId}/thumbnail", MangaController.thumbnail)
+            get("{mangaId}/chapters", MangaController.chapterList)
+            get("{mangaId}/chapter/{chapterIndex}", MangaController.chapterRetrieve)
+            get("{mangaId}/chapter/{chapterIndex}/pages", MangaController.pageResourceList)
+            get("{mangaId}/chapter/{chapterIndex}/page/{index}", MangaController.pageRetrieve)
+        }
+
+        path("gomanga") {
+            post("builtin-komga/{sourceId}/activate", BuiltInKomgaController.activate)
+            post("builtin-komga/{sourceId}/deactivate", BuiltInKomgaController.deactivate)
+            // host-owned-cookie-routing 4.1: proactive host->server cookie seed.
+            post("cf-cookies", MangaController.cfCookieSeed)
+            // GoMangaStableDefaultUA: set the server's stable ecosystem source
+            // UA at boot (clearance/UA pairing is per-request, never global).
+            post("default-ua", MangaController.gomangaDefaultUa)
+            // GoMangaInsecureHttpGate: mirror the app-side InsecureSourcePolicy
+            // ("允許不安全的來源") onto the server's OkHttp egress. Pushed at boot
+            // and on toggle flip; fail-closed until pushed.
+            post("allow-insecure-http", MangaController.gomangaAllowInsecureHttp)
         }
     }
 }

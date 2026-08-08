@@ -17,7 +17,15 @@ import suwayomi.tachidesk.server.JavalinSetup.future
 import kotlin.io.path.inputStream
 
 object GraphQLController {
-    private val server = TachideskGraphQLServer.create()
+    // GoManga slim-mode: build the GraphQL schema lazily, on the first GraphQL
+    // request, instead of eagerly during Javalin route registration. The schema
+    // build is a heavy graphql-kotlin reflection pass (~4s on the iOS
+    // pure-interpreter OpenJ9 JVM) and is NOT required by the REST readiness
+    // endpoint (/api/v1/settings/about), so deferring it lets the embedded server
+    // answer REST ~4s sooner on cold start. The first GraphQL query pays the
+    // one-time build cost (the host can hide it by issuing a warm-up query off the
+    // critical path). SYNCHRONIZED lazy => safe under concurrent first requests.
+    private val server by lazy { TachideskGraphQLServer.create() }
 
     /** execute graphql query */
     fun execute(ctx: Context) {

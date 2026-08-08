@@ -14,6 +14,8 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaProviderFactory
 import suwayomi.tachidesk.manga.impl.util.PackageTools.loadExtensionSources
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
@@ -45,6 +47,12 @@ object GetSource {
             transaction {
                 ExtensionTable.selectAll().where { ExtensionTable.id eq extensionId }.first()
             }
+
+        if (BuiltInKomgaLifecycle.isSentinel(extensionRecord)) {
+            val source = BuiltInKomgaProviderFactory.create(sourceId)
+            sourceCache[sourceId] = source
+            return source
+        }
 
         val apkName =
             extensionRecord[ExtensionTable.apkName]

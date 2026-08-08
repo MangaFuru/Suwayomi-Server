@@ -12,6 +12,7 @@ import gg.jte.TemplateEngine
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.javalin.Javalin
 import io.javalin.apibuilder.ApiBuilder.after
+import io.javalin.apibuilder.ApiBuilder.get
 import io.javalin.apibuilder.ApiBuilder.path
 import io.javalin.config.RoutesConfig
 import io.javalin.http.Context
@@ -33,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.eclipse.jetty.server.ServerConnector
 import suwayomi.tachidesk.global.GlobalAPI
+import suwayomi.tachidesk.global.controller.SettingsController
 import suwayomi.tachidesk.graphql.GraphQL
 import suwayomi.tachidesk.graphql.types.AuthMode
 import suwayomi.tachidesk.i18n.LocalizationHelper
@@ -60,9 +62,30 @@ object JavalinSetup {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /**
+     * GoManga: the live Javalin app, retained so the embedded HTTP server can be
+     * restarted inside the already-running JVM (the JVM itself is a per-process
+     * singleton and cannot be re-created on iOS). Set after each [javalinSetup].
+     */
+    @Volatile
+    private var currentApp: Javalin? = null
+
+    /** GoManga: the JVM-shutdown hook is process-scoped — install it only once. */
+    @Volatile
+    private var shutdownHookInstalled = false
+
     fun <T> future(block: suspend CoroutineScope.() -> T): CompletableFuture<T> = scope.future(block = block)
 
     fun javalinSetup() {
+        // ── GoManga slim-mode ──
+        // The iOS GoManga embed uses Suwayomi only as an extension parser host, so
+        // it registers ONLY the minimal route surface (settings/about readiness +
+        // the MangaAPI source/manga route groups) and skips the full stock REST/
+        // OPDS/WebSocket/GraphQL/webUI surface + the desktop auth wiring to cut
+        // cold start. GraphQL can be re-enabled independently for debugging.
+        val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
+        val graphQLEnabled =
+            !slimMode || System.getProperty("suwayomi.tachidesk.gomanga.graphqlEnabled", "false") == "true"
         val app =
             Javalin.start { config ->
                 val templateEngine = TemplateEngine.createPrecompiled(ContentType.Html)
@@ -70,7 +93,11 @@ object JavalinSetup {
 
                 config.jsonMapper(JavalinJackson3())
 
-                WebInterfaceManager.setup(config)
+                // GoManga: skip webUI static-file serving (and its async copy/setup
+                // I/O) in slim mode — the iOS embed never serves the SPA.
+                if (!slimMode) {
+                    WebInterfaceManager.setup(config)
+                }
 
                 // config.registerPlugin(OpenApiPlugin(getOpenApiOptions()))
 
@@ -105,154 +132,218 @@ object JavalinSetup {
                     }
                 }
 
-                config.bundledPlugins.enableCors { cors ->
-                    cors.addRule {
-                        it.allowCredentials = true
-                        it.reflectClientOrigin = true
+                // GoManga: the iOS embed talks to a fixed loopback origin and never
+                // needs browser CORS; skip it in slim mode.
+                if (!slimMode) {
+                    config.bundledPlugins.enableCors { cors ->
+                        cors.addRule {
+                            it.allowCredentials = true
+                            it.reflectClientOrigin = true
+                        }
                     }
                 }
 
                 config.routes.defineCore()
                 config.routes.apiBuilder {
                     path(ServerSubpath.maybeAddAsPrefix("api/")) {
-                        path("v1/") {
-                            GlobalAPI.defineEndpoints()
-                            MangaAPI.defineEndpoints()
-                        }
+                        if (slimMode) {
+                            // GoManga slim surface: ONLY the readiness probe the host
+                            // polls + the MangaAPI route groups (extension/source/
+                            // manga, plus the gomanga groups the other patches add).
+                            // Stock GlobalAPI/OPDS and the catch-all 404 are dropped.
+                            path("v1/") {
+                                path("settings") {
+                                    get("about", SettingsController.about)
+                                }
+                                MangaAPI.defineEndpoints()
+                            }
+                            if (graphQLEnabled) {
+                                GraphQL.defineEndpoints()
+                            }
+                        } else {
+                            path("v1/") {
+                                GlobalAPI.defineEndpoints()
+                                MangaAPI.defineEndpoints()
+                            }
 
-                        OpdsAPI.defineEndpoints()
-                        GraphQL.defineEndpoints()
+                            OpdsAPI.defineEndpoints()
+                            GraphQL.defineEndpoints()
 
-                        after { ctx ->
-                            // If not matched, the request was for an invalid endpoint
-                            // Return a 404 instead of redirecting to the UI for usability
-                            if (ctx.endpoints().lastHttpEndpoint()?.path == "*") {
-                                throw NotFoundResponse()
+                            after { ctx ->
+                                // If not matched, the request was for an invalid endpoint
+                                // Return a 404 instead of redirecting to the UI for usability
+                                if (ctx.endpoints().lastHttpEndpoint()?.path == "*") {
+                                    throw NotFoundResponse()
+                                }
                             }
                         }
                     }
                 }
 
-                config.events.serverStarted {
-                    if (serverConfig.initialOpenInBrowserEnabled.value) {
-                        scope.launch {
-                            withTimeoutOrNull(10.seconds) {
-                                WebInterfaceManager.isSetupComplete.first { it }
+                // GoManga: opening a desktop browser is meaningless on the iOS embed
+                // (and would block on WebInterfaceManager setup that slim mode never
+                // runs); skip this heavy startup side-effect in slim mode.
+                if (!slimMode) {
+                    config.events.serverStarted {
+                        if (serverConfig.initialOpenInBrowserEnabled.value) {
+                            scope.launch {
+                                withTimeoutOrNull(10.seconds) {
+                                    WebInterfaceManager.isSetupComplete.first { it }
+                                }
+                                Browser.openInBrowser()
                             }
-                            Browser.openInBrowser()
                         }
                     }
                 }
             }
 
-        // when JVM is prompted to shutdown, stop javalin gracefully
-        Runtime.getRuntime().addShutdownHook(
-            thread(start = false) {
-                app.stop()
-            },
-        )
+        // when JVM is prompted to shutdown, stop javalin gracefully. GoManga:
+        // install the process-scoped hook once and target the CURRENT app, so a
+        // restart (which replaces `currentApp`) doesn't pile up stale hooks.
+        currentApp = app
+        if (!shutdownHookInstalled) {
+            shutdownHookInstalled = true
+            Runtime.getRuntime().addShutdownHook(
+                thread(start = false) {
+                    currentApp?.stop()
+                },
+            )
+        }
     }
 
     fun RoutesConfig.defineCore() {
+        // GoManga: defineCore runs during config-building (before the app is
+        // started), so it cannot see javalinSetup's local `slimMode`; recompute it
+        // from the same system property the rest of the slim wiring reads.
+        val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
         val loginPath = ServerSubpath.maybeAddAsPrefix("/login.html")
 
-        get(loginPath) { ctx ->
-            val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
-            ctx.header("content-type", "text/html")
-            val httpCacheSeconds = 1.days.inWholeSeconds
-            ctx.header("cache-control", "max-age=$httpCacheSeconds")
-            ctx.render(
-                "Login.jte",
-                mapOf(
-                    "locale" to locale,
-                    "error" to "",
-                ),
-            )
-        }
-
-        post(loginPath) { ctx ->
-            val username = ctx.formParam("user")
-            val password = ctx.formParam("pass")
-            val isValid =
-                username == serverConfig.authUsername.value &&
-                    password == serverConfig.authPassword.value
-
-            if (isValid) {
-                val redirect = ctx.queryParam("redirect") ?: ServerSubpath.maybeAddAsPrefix("/")
-                val uri = URI(redirect)
-                if (uri.host != null || uri.scheme != null) {
-                    throw IllegalArgumentException("Given redirect is not relative, refusing")
+        // ── GoManga slim-mode auth ──
+        // Stock auth lives in `beforeMatched`, which is what populates
+        // `Attribute.TachideskUser`. The slim `GET /api/v1/settings/about` handler
+        // (SettingsController.about) calls `getAttribute(TachideskUser).requireUser()`,
+        // and `getAttribute` is a non-null assertion (`attribute(name)!!`) — so if we
+        // simply dropped `beforeMatched` the about route would NPE on every request.
+        //
+        // We therefore DO NOT skip auth wiring entirely in slim mode. Instead we
+        // register a minimal `beforeMatched` that ONLY resolves + sets the user
+        // attributes (no SIMPLE_LOGIN redirect, no BASIC_AUTH 401 challenge, no
+        // login.html page routes — none of which the iOS embed uses). Because the
+        // embed runs with the default `authMode = NONE`, `getUserFromContext`
+        // returns `Admin(1)`, so `requireUser()` succeeds and `about` returns 200.
+        // This is a DELIBERATE narrowing: it is NOT a silent bypass of an enabled
+        // credential check — if a non-NONE authMode were ever set under slim mode,
+        // `getUserFromContext` would yield `Visitor` and the handler's own
+        // `requireUser()` would still 401. Non-slim auth below is unchanged.
+        if (slimMode) {
+            beforeMatched { ctx ->
+                ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
+                ctx.setAttribute(Attribute.TachideskBasic, false)
+            }
+            wsBefore {
+                it.onConnect { ctx ->
+                    ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
                 }
-                // NOTE: We currently have no session handler attached.
-                // Thus, all sessions are stored in memory and not persisted.
-                // Furthermore, default session timeout appears to be 30m
-                ctx.header("Location", redirect)
-                ctx.sessionAttribute("logged-in", username)
-                throw RedirectResponse(HttpStatus.SEE_OTHER)
+            }
+        } else {
+            get(loginPath) { ctx ->
+                val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
+                ctx.header("content-type", "text/html")
+                val httpCacheSeconds = 1.days.inWholeSeconds
+                ctx.header("cache-control", "max-age=$httpCacheSeconds")
+                ctx.render(
+                    "Login.jte",
+                    mapOf(
+                        "locale" to locale,
+                        "error" to "",
+                    ),
+                )
             }
 
-            val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
-            ctx.header("content-type", "text/html")
-            ctx.req().session.invalidate()
-            ctx.render(
-                "Login.jte",
-                mapOf(
-                    "locale" to locale,
-                    "error" to "Invalid username or password",
-                ),
-            )
-        }
+            post(loginPath) { ctx ->
+                val username = ctx.formParam("user")
+                val password = ctx.formParam("pass")
+                val isValid =
+                    username == serverConfig.authUsername.value &&
+                        password == serverConfig.authPassword.value
 
-        beforeMatched { ctx ->
-            val isWebManifest =
-                listOf("site.webmanifest", "manifest.json", "login.html").any { ctx.path().endsWith(it) }
-            val isPageIcon =
-                ctx.path().startsWith('/') &&
-                    !ctx.path().substring(1).contains('/') &&
-                    listOf(".png", ".jpg", ".ico").any { ctx.path().endsWith(it) }
-            val isPreFlight = ctx.method() == HandlerType.OPTIONS
-            val isApi = ctx.path().startsWith(ServerSubpath.maybeAddAsPrefix("/api/"))
+                if (isValid) {
+                    val redirect = ctx.queryParam("redirect") ?: ServerSubpath.maybeAddAsPrefix("/")
+                    val uri = URI(redirect)
+                    if (uri.host != null || uri.scheme != null) {
+                        throw IllegalArgumentException("Given redirect is not relative, refusing")
+                    }
+                    // NOTE: We currently have no session handler attached.
+                    // Thus, all sessions are stored in memory and not persisted.
+                    // Furthermore, default session timeout appears to be 30m
+                    ctx.header("Location", redirect)
+                    ctx.sessionAttribute("logged-in", username)
+                    throw RedirectResponse(HttpStatus.SEE_OTHER)
+                }
 
-            val requiresAuthentication = !isPreFlight && !isPageIcon && !isWebManifest
-            if (!requiresAuthentication) {
-                return@beforeMatched
+                val locale: Locale = LocalizationHelper.ctxToLocale(ctx)
+                ctx.header("content-type", "text/html")
+                ctx.req().session.invalidate()
+                ctx.render(
+                    "Login.jte",
+                    mapOf(
+                        "locale" to locale,
+                        "error" to "Invalid username or password",
+                    ),
+                )
             }
 
-            val authMode = serverConfig.authMode.value
+            beforeMatched { ctx ->
+                val isWebManifest =
+                    listOf("site.webmanifest", "manifest.json", "login.html").any { ctx.path().endsWith(it) }
+                val isPageIcon =
+                    ctx.path().startsWith('/') &&
+                        !ctx.path().substring(1).contains('/') &&
+                        listOf(".png", ".jpg", ".ico").any { ctx.path().endsWith(it) }
+                val isPreFlight = ctx.method() == HandlerType.OPTIONS
+                val isApi = ctx.path().startsWith(ServerSubpath.maybeAddAsPrefix("/api/"))
 
-            fun credentialsValid(): Boolean {
-                val basicAuthCredentials = ctx.basicAuthCredentials() ?: return false
-                val (username, password) = basicAuthCredentials
-                return username == serverConfig.authUsername.value &&
-                    password == serverConfig.authPassword.value
+                val requiresAuthentication = !isPreFlight && !isPageIcon && !isWebManifest
+                if (!requiresAuthentication) {
+                    return@beforeMatched
+                }
+
+                val authMode = serverConfig.authMode.value
+
+                fun credentialsValid(): Boolean {
+                    val basicAuthCredentials = ctx.basicAuthCredentials() ?: return false
+                    val (username, password) = basicAuthCredentials
+                    return username == serverConfig.authUsername.value &&
+                        password == serverConfig.authPassword.value
+                }
+
+                fun cookieValid(): Boolean {
+                    val username = ctx.sessionAttribute<String>("logged-in") ?: return false
+                    return username == serverConfig.authUsername.value
+                }
+
+                if (authMode == AuthMode.SIMPLE_LOGIN && !cookieValid() && !isApi) {
+                    val url =
+                        "$loginPath?redirect=" + URLEncoder.encode(ctx.path() + (ctx.queryString()?.let { "?" + it } ?: ""), Charsets.UTF_8)
+                    ctx.header("Location", url)
+                    throw RedirectResponse(HttpStatus.SEE_OTHER)
+                }
+
+                if (authMode == AuthMode.BASIC_AUTH && !credentialsValid()) {
+                    ctx.header("WWW-Authenticate", "Basic")
+                    throw UnauthorizedResponse()
+                }
+
+                ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
+                ctx.setAttribute(Attribute.TachideskBasic, credentialsValid())
             }
 
-            fun cookieValid(): Boolean {
-                val username = ctx.sessionAttribute<String>("logged-in") ?: return false
-                return username == serverConfig.authUsername.value
+            wsBefore {
+                it.onConnect { ctx ->
+                    ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
+                }
             }
-
-            if (authMode == AuthMode.SIMPLE_LOGIN && !cookieValid() && !isApi) {
-                val url =
-                    "$loginPath?redirect=" + URLEncoder.encode(ctx.path() + (ctx.queryString()?.let { "?" + it } ?: ""), Charsets.UTF_8)
-                ctx.header("Location", url)
-                throw RedirectResponse(HttpStatus.SEE_OTHER)
-            }
-
-            if (authMode == AuthMode.BASIC_AUTH && !credentialsValid()) {
-                ctx.header("WWW-Authenticate", "Basic")
-                throw UnauthorizedResponse()
-            }
-
-            ctx.setAttribute(Attribute.TachideskUser, getUserFromContext(ctx))
-            ctx.setAttribute(Attribute.TachideskBasic, credentialsValid())
-        }
-
-        wsBefore {
-            it.onConnect { ctx ->
-                ctx.setAttribute(Attribute.TachideskUser, getUserFromWsContext(ctx))
-            }
-        }
+        } // end !slimMode auth/login/ws wiring
 
         exception(NullPointerException::class.java) { e, ctx ->
             logger.error(e) { "NullPointerException while handling the request" }
@@ -285,6 +376,83 @@ object JavalinSetup {
             ctx.status(HttpStatus.FORBIDDEN)
             ctx.result(e.message ?: "Forbidden")
         }
+    }
+
+    /**
+     * GoManga: restart ONLY the embedded HTTP server (Javalin + its Jetty
+     * connector) inside the already-running JVM, re-binding the same port.
+     *
+     * The SDK calls this over JNI when the host app detects the loopback REST
+     * listener has died — e.g. after an iOS background freeze→thaw left Jetty's
+     * NIO acceptor in a dead state — because the OpenJ9 JVM is a per-process
+     * singleton that cannot be re-created in-process (otherwise the user must
+     * kill the app). It stops the previous Javalin app (releasing the port) and
+     * re-runs [javalinSetup] on a fresh `Server`; it deliberately does NOT touch
+     * the DB, Koin/DI modules, or the source/extension runtime, which stay live
+     * from the original boot. Returns once the new listener is up; throws if the
+     * rebind fails, which the SDK surfaces to the host.
+     *
+     * Invoked from the native layer (`gomanga_jvm_restart_suwayomi`) on a freshly
+     * attached thread; never call it concurrently with itself.
+     */
+    @JvmStatic
+    fun gomangaRestartHttpServer() {
+        logger.info { "GoManga: restarting embedded HTTP server (in-JVM)…" }
+        withAppClassLoader {
+            stopCurrentApp()
+            javalinSetup()
+        }
+        logger.info { "GoManga: embedded HTTP server restarted" }
+    }
+
+    /**
+     * GoManga: STOP the embedded HTTP server (Javalin/Jetty) inside the running
+     * JVM WITHOUT restarting it, releasing the listener + Jetty threads + the
+     * loopback port. The host calls this when it proactively pauses source work
+     * for a long iOS background: a stopped HTTP layer means a much smaller
+     * background footprint (lower jetsam risk) AND no live NIO acceptor for an
+     * iOS freeze→thaw to corrupt — so [gomangaRestartHttpServer] on return is a
+     * clean rebind. The DB/Koin/source runtime stay live from the original boot.
+     */
+    @JvmStatic
+    fun gomangaStopHttpServer() {
+        logger.info { "GoManga: stopping embedded HTTP server (in-JVM)…" }
+        withAppClassLoader {
+            stopCurrentApp()
+        }
+        logger.info { "GoManga: embedded HTTP server stopped" }
+    }
+
+    /**
+     * Run [block] with the thread context classloader pinned to the application
+     * loader. The native stop/restart entries arrive on a freshly JNI-attached
+     * thread whose context classloader is the system loader, NOT the loader that
+     * loaded the Suwayomi fat jar. Jetty/Javalin resolve servlet + WebSocket
+     * factory classes (e.g. WebSocketServerFactory) through the THREAD CONTEXT
+     * classloader during app.start(); without this they throw
+     * ClassNotFoundException — even though the same classes loaded fine on the
+     * original boot, which ran on the primordial thread.
+     */
+    private fun withAppClassLoader(block: () -> Unit) {
+        val thread = Thread.currentThread()
+        val previousClassLoader = thread.contextClassLoader
+        thread.contextClassLoader = JavalinSetup::class.java.classLoader
+        try {
+            block()
+        } finally {
+            thread.contextClassLoader = previousClassLoader
+        }
+    }
+
+    /** Stop + clear the current Javalin app. A dead Jetty can throw on stop; the
+     *  caller proceeds regardless (a fresh server is created on the next start). */
+    private fun stopCurrentApp() {
+        try {
+            currentApp?.stop()
+        } catch (e: Throwable) {
+            logger.warn(e) { "GoManga: ignoring error while stopping Javalin" }
+        }
+        currentApp = null
     }
 
     // private fun getOpenApiOptions(): OpenApiOptions {

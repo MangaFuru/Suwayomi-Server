@@ -43,7 +43,6 @@ dependencies {
     implementation(libs.bundles.settings)
 
     // Android version of SimpleDateFormat
-    implementation(libs.icu4j)
 
     // OpenJDK lacks native JPEG encoder and native WEBP decoder
     implementation(libs.bundles.twelvemonkeys)

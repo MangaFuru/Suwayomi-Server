@@ -1,4 +1,13 @@
 
+# MangaFuru / GoManga downstream source mirror
+
+> [!IMPORTANT]
+> This branch publishes the modified Suwayomi-Server source used by MangaFuru's
+> GoManga iOS runtime. It is based on the exact upstream `v2.3.2243` tag and is
+> maintained independently from the Suwayomi project. See
+> [GOMANGA-NOTICE.md](GOMANGA-NOTICE.md) for scope, provenance, verification,
+> and reproducible patches.
+
 | Build                                                                                         | Stable                                                                                                                                                                   | Preview                                                                                                                                                                                                                                           | Support Server |
 |-----------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
 | ![CI](https://github.com/Suwayomi/Suwayomi-Server/actions/workflows/build_push.yml/badge.svg) | [![stable release](https://img.shields.io/github/release/Suwayomi/Suwayomi-Server.svg?maxAge=3600&label=download)](https://github.com/Suwayomi/Suwayomi-Server/releases) | [![preview](https://img.shields.io/badge/dynamic/json?url=https://github.com/Suwayomi/Suwayomi-Server-preview/raw/main/index.json&label=download&query=$.latest&color=blue)](https://github.com/Suwayomi/Suwayomi-Server-preview/releases/latest) | [![Discord](https://img.shields.io/discord/801021177333940224.svg?label=discord&labelColor=7289da&color=2c2f33&style=flat)](https://discord.gg/DDZdqZWaHA) |

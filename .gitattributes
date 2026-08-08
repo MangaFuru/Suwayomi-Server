@@ -29,3 +29,7 @@
 *.avif binary
 *.heif binary
 *.jxl binary
+
+# Unified-diff context markers are meaningful, including a single space on
+# otherwise blank context lines.
+*.patch whitespace=-blank-at-eol,-blank-at-eof
