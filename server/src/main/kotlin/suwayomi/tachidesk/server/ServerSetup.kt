@@ -162,7 +162,10 @@ fun serverModule(applicationDirs: ApplicationDirs): Module =
     }
 
 @OptIn(DelicateCoroutinesApi::class)
-fun applicationSetup() {
+fun applicationSetup() = applicationSetup {}
+
+@OptIn(DelicateCoroutinesApi::class)
+internal fun applicationSetup(onModulesReady: () -> Unit) {
     Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
         KotlinLogging.logger {}.error(throwable) { "unhandled exception" }
     }
@@ -298,6 +301,8 @@ fun applicationSetup() {
             },
         )
     }
+
+    onModulesReady()
 
     // Make sure only one instance of the app is running
     if (!slimMode) {

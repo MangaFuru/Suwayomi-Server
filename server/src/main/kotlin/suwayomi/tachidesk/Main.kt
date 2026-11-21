@@ -8,7 +8,9 @@ package suwayomi.tachidesk
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import suwayomi.tachidesk.graphql.server.GraphQLSchemaProvider
-import suwayomi.tachidesk.server.JavalinSetup.javalinSetup
+import suwayomi.tachidesk.server.JavalinSetup
+import java.util.concurrent.FutureTask
+import kotlin.concurrent.thread
 import suwayomi.tachidesk.server.applicationSetup
 
 fun main() {
@@ -17,6 +19,20 @@ fun main() {
         java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.graphqlEnabled")) {
         GraphQLSchemaProvider.init()
     }
-    applicationSetup()
-    javalinSetup()
+    if (java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.slimMode")) {
+        // Prepare routes and Jetty while the existing database is being validated.
+        // Only start the listener after both the data and source registry are ready.
+        val http = FutureTask { JavalinSetup.prepareHttp() }
+        try {
+            applicationSetup {
+                thread(name = "gomanga-prepare-http", isDaemon = true) { http.run() }
+            }
+            JavalinSetup.startPrepared(http.get())
+        } finally {
+            http.cancel(false)
+        }
+    } else {
+        applicationSetup()
+        JavalinSetup.javalinSetup()
+    }
 }

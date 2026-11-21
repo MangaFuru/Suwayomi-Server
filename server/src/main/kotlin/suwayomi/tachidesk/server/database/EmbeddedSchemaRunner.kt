@@ -13,8 +13,8 @@ import kotlin.time.Clock
 
 /** Apply the exact missing known migrations, even when additional receipts exist. */
 internal object EmbeddedSchemaRunner {
-    fun preflight(connection: Connection, registrations: List<Migration>): Int {
-        val prefix = EmbeddedMigrationLedger.completedPrefix(connection, registrations.map { it.name })
+    fun preflight(connection: Connection, names: List<String>): Int {
+        val prefix = EmbeddedMigrationLedger.completedPrefix(connection, names)
         check(prefix >= 59) { "Unsupported current-engine migration prefix" }
         // Required inputs of the historical projection, chapter progress and timestamp migrations.
         val expected = mapOf(

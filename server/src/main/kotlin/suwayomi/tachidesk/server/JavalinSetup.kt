@@ -85,7 +85,9 @@ object JavalinSetup {
 
     fun <T> future(block: suspend CoroutineScope.() -> T): CompletableFuture<T> = scope.future(block = block)
 
-    fun javalinSetup() {
+    fun javalinSetup() = startPrepared(prepareHttp())
+
+    internal fun prepareHttp(): Javalin {
         // ── GoManga slim-mode ──
         // The iOS GoManga embed uses Suwayomi only as an extension parser host, so
         // it registers ONLY the minimal route surface (settings/about readiness +
@@ -96,9 +98,11 @@ object JavalinSetup {
         val graphQLEnabled =
             !slimMode || System.getProperty("suwayomi.tachidesk.gomanga.graphqlEnabled", "false") == "true"
         val app =
-            Javalin.start { config ->
-                val templateEngine = TemplateEngine.createPrecompiled(ContentType.Html)
-                config.fileRenderer(JavalinJte(templateEngine))
+            Javalin.create { config ->
+                if (!slimMode) {
+                    val templateEngine = TemplateEngine.createPrecompiled(ContentType.Html)
+                    config.fileRenderer(JavalinJte(templateEngine))
+                }
 
                 config.jsonMapper(JavalinJackson3())
 
@@ -131,8 +135,10 @@ object JavalinSetup {
 
                                 connector.host = newIp
                                 connector.port = newPort
-                                connector.stop()
-                                connector.start()
+                                if (server.isStarted) {
+                                    connector.stop()
+                                    connector.start()
+                                }
 
                                 logger.info { "Server ip and/or port changed from $oldIp:$oldPort to $newIp:$newPort " }
                             },
@@ -226,6 +232,12 @@ object JavalinSetup {
                 }
             }
 
+        app.jettyServer().server()
+        return app
+    }
+
+    internal fun startPrepared(app: Javalin) {
+        app.start()
         // when JVM is prompted to shutdown, stop javalin gracefully. GoManga:
         // install the process-scoped hook once and target the CURRENT app, so a
         // restart (which replaces `currentApp`) doesn't pile up stale hooks.
