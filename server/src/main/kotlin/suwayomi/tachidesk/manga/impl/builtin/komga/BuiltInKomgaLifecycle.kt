@@ -21,6 +21,7 @@ import org.jetbrains.exposed.v1.jdbc.insertAndGetId
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
+import suwayomi.tachidesk.server.database.DBManager
 import suwayomi.tachidesk.manga.impl.Source
 import suwayomi.tachidesk.manga.impl.util.PackageTools
 import suwayomi.tachidesk.manga.impl.util.source.GetSource
@@ -95,7 +96,8 @@ object BuiltInKomgaLifecycle {
             }
 
             BuiltInKomgaProviderFactory.validate()
-            val plan = transaction { initializePersistence() }
+            val plan = DBManager.embeddedSourceConnection()?.use(::canonicalInitializationPlan)
+                ?: transaction { initializePersistence() }
 
             plan.sourceIdsToUnregister.forEach(GetSource::unregisterSource)
             removeLegacyProviderJars(plan.legacyApkNames)
@@ -238,6 +240,33 @@ object BuiltInKomgaLifecycle {
     fun isSentinel(row: ResultRow): Boolean =
         row[ExtensionTable.pkgName] == packageId &&
             row[ExtensionTable.classFQName] == sentinelClassName
+
+    private fun canonicalInitializationPlan(db: java.sql.Connection): InitializationPlan? {
+        val rowsSeen = mutableSetOf<Long>()
+        var sentinelId: Int? = null
+        db.prepareStatement("""
+            SELECT E.ID, E.CLASS_NAME, E.APK_NAME, S.ID
+            FROM EXTENSION E LEFT JOIN SOURCE S ON S.EXTENSION = E.ID
+            WHERE E.PKG_NAME = ?
+        """).use { sql ->
+            sql.setString(1, packageId)
+            sql.executeQuery().use { rows ->
+                while (rows.next()) {
+                    val id = rows.getInt(1)
+                    if (sentinelId != null && id != sentinelId) return null
+                    if (rows.getString(2) != sentinelClassName || rows.getString(3) != null) return null
+                    sentinelId = id
+                    val source = rows.getLong(4)
+                    if (!rows.wasNull()) {
+                        if (source !in allowedSourceIds) return null
+                        rowsSeen.add(source)
+                    }
+                }
+            }
+        }
+        if (sentinelId == null) return null
+        return InitializationPlan(rowsSeen, allowedSourceIds.filter { it in rowsSeen }, emptySet())
+    }
 
     private fun initializePersistence(): InitializationPlan {
         val extensionRows =

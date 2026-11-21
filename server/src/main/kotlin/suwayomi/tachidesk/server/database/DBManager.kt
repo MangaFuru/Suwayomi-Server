@@ -38,6 +38,11 @@ object DBManager {
     @Volatile
     private var hikariDataSource: HikariDataSource? = null
 
+    internal fun embeddedSourceConnection(): java.sql.Connection? =
+        if (java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.slimMode") && serverConfig.databaseType.value == DatabaseType.H2) {
+            hikariDataSource?.connection
+        } else null
+
     private fun createHikariDataSource(): HikariDataSource {
         val applicationDirs = Injekt.get<ApplicationDirs>()
         val config =

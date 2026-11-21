@@ -44,6 +44,7 @@ import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.insertAndGetId
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import suwayomi.tachidesk.server.database.DBManager
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.registerSource
 import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
@@ -469,29 +470,37 @@ class LocalSource(
         val pageCache: MutableMap<String, List<() -> InputStream>> = mutableMapOf()
 
         fun register() {
-            transaction {
-                val sourceRecord = SourceTable.selectAll().where { SourceTable.id eq ID }.firstOrNull()
+            val exists = DBManager.embeddedSourceConnection()?.use { db ->
+                db.prepareStatement("SELECT 1 FROM SOURCE WHERE ID = ?").use { sql ->
+                    sql.setLong(1, ID)
+                    sql.executeQuery().use { it.next() }
+                }
+            }
+            if (exists != true) {
+                transaction {
+                    val sourceRecord = SourceTable.selectAll().where { SourceTable.id eq ID }.firstOrNull()
 
-                if (sourceRecord == null) {
-                    // must do this to avoid database integrity errors
-                    val extensionId =
-                        ExtensionTable.insertAndGetId {
-                            it[apkName] = "localSource"
-                            it[name] = EXTENSION_NAME
-                            it[pkgName] = LocalSource::class.java.`package`.name
-                            it[versionName] = "1.2"
-                            it[versionCode] = 0
+                    if (sourceRecord == null) {
+                        // must do this to avoid database integrity errors
+                        val extensionId =
+                            ExtensionTable.insertAndGetId {
+                                it[apkName] = "localSource"
+                                it[name] = EXTENSION_NAME
+                                it[pkgName] = LocalSource::class.java.`package`.name
+                                it[versionName] = "1.2"
+                                it[versionCode] = 0
+                                it[lang] = LANG
+                                it[extensionLib] = "1.2"
+                                it[contentWarning] = 0
+                                it[isInstalled] = true
+                            }
+
+                        SourceTable.insert {
+                            it[id] = ID
+                            it[name] = NAME
                             it[lang] = LANG
-                            it[extensionLib] = "1.2"
-                            it[contentWarning] = 0
-                            it[isInstalled] = true
+                            it[extension] = extensionId
                         }
-
-                    SourceTable.insert {
-                        it[id] = ID
-                        it[name] = NAME
-                        it[lang] = LANG
-                        it[extension] = extensionId
                     }
                 }
             }
