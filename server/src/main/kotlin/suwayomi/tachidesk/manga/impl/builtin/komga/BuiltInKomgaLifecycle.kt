@@ -269,16 +269,21 @@ object BuiltInKomgaLifecycle {
                 .mapNotNull { it[ExtensionTable.apkName] }
                 .toSet()
 
-        if (extensionIds.isNotEmpty()) {
-            SourceTable.deleteWhere { SourceTable.extension inList extensionIds }
-            ExtensionTable.deleteWhere { ExtensionTable.id inList extensionIds }
-        }
-        val sentinelId = ensureSentinel()
-        persistedActiveIds.forEach { sourceId ->
-            insertSource(
-                BuiltInKomgaProviderFactory.slot(sourceId)!!,
-                sentinelId.value,
-            )
+        // Replacing a canonical sentinel cascades to data referencing its stable ID.
+        val alreadyCanonical = extensionRows.size == 1 && !hasLegacyPayload &&
+            sourceIdsToUnregister.all { it in allowedSourceIds }
+        if (!alreadyCanonical) {
+            if (extensionIds.isNotEmpty()) {
+                SourceTable.deleteWhere { SourceTable.extension inList extensionIds }
+                ExtensionTable.deleteWhere { ExtensionTable.id inList extensionIds }
+            }
+            val sentinelId = ensureSentinel()
+            persistedActiveIds.forEach { sourceId ->
+                insertSource(
+                    BuiltInKomgaProviderFactory.slot(sourceId)!!,
+                    sentinelId.value,
+                )
+            }
         }
 
         return InitializationPlan(
