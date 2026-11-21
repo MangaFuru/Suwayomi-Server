@@ -80,6 +80,7 @@ internal object EmbeddedSchemaRunner {
                             EmbeddedUniqueIndexes.ensureUnique(connection, "CATEGORYMANGA", "UC_CATEGORYMANGA", listOf("MANGA", "CATEGORY"))
                         }
                         64 -> EmbeddedSyncFlagColumns.ensure(connection)
+                        65 -> EmbeddedSyncTriggers.withChapterTimestampMigration(connection) { migration.run() }
                         else -> migration.run()
                     }
                     MigrationEntity.new {

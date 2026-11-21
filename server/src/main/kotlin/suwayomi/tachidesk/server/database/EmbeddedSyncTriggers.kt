@@ -4,6 +4,8 @@ import java.sql.Connection
 
 /** Reconcile only trigger names owned by the shipped H2 migrations. */
 internal object EmbeddedSyncTriggers {
+    private val chapterTimestampMigration = ThreadLocal.withInitial { false }
+
     private data class Spec(val name: String, val table: String, val timing: String, val events: Set<String>, val handler: String)
     private fun spec(name: String, table: String, timing: String, events: String, handler: String) =
         Spec(name, table, timing, events.split(",").toSet(), "suwayomi.tachidesk.server.database.trigger.${handler}Trigger")
@@ -21,6 +23,54 @@ internal object EmbeddedSyncTriggers {
         spec("INSERT_CATEGORY_UID", "CATEGORY", "BEFORE", "INSERT", "InsertCategoryUid"),
         spec("UPDATE_CATEGORY_VERSION", "CATEGORY", "BEFORE", "UPDATE", "UpdateCategoryVersion"),
     )
+
+    /**
+     * M0065 changes only chapter.date_upload. Guard the two shipped chapter UPDATE handlers
+     * while it runs, but only when their persisted H2 definitions are exactly ours. This avoids
+     * per-row Kotlin trigger work without disabling an extension/user trigger or changing retry
+     * and receipt behavior.
+     */
+    fun <T> withChapterTimestampMigration(connection: Connection, action: () -> T): T {
+        if (connection.metaData.databaseProductName != "H2" || !hasExpectedChapterUpdateTriggers(connection)) {
+            return action()
+        }
+        chapterTimestampMigration.set(true)
+        return try {
+            action()
+        } finally {
+            chapterTimestampMigration.remove()
+        }
+    }
+
+    internal fun chapterTimestampMigrationActive(): Boolean = chapterTimestampMigration.get()
+
+    private fun hasExpectedChapterUpdateTriggers(connection: Connection): Boolean {
+        val expected = mapOf(
+            "UPDATE_CHAPTER_AND_MANGA_VERSION" to "suwayomi.tachidesk.server.database.trigger.UpdateChapterAndMangaVersionTrigger",
+            "UPDATE_CHAPTER_LAST_MODIFIED_AT" to "suwayomi.tachidesk.server.database.trigger.UpdateChapterLastModifiedAtTrigger",
+        )
+        val seen = mutableSetOf<String>()
+        connection.prepareStatement("""
+            SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, JAVA_CLASS, ACTION_ORIENTATION
+            FROM INFORMATION_SCHEMA.TRIGGERS
+            WHERE TRIGGER_SCHEMA='PUBLIC' AND TRIGGER_NAME IN (?, ?)
+        """).use { statement ->
+            statement.setString(1, expected.keys.elementAt(0))
+            statement.setString(2, expected.keys.elementAt(1))
+            statement.executeQuery().use { rows ->
+                while (rows.next()) {
+                    val name = rows.getString("TRIGGER_NAME")
+                    if (rows.getString("EVENT_OBJECT_TABLE") == "CHAPTER" &&
+                        rows.getString("ACTION_TIMING") == "BEFORE" &&
+                        rows.getString("EVENT_MANIPULATION") == "UPDATE" &&
+                        rows.getString("JAVA_CLASS") == expected[name] &&
+                        rows.getString("ACTION_ORIENTATION") == "ROW"
+                    ) seen += name
+                }
+            }
+        }
+        return seen == expected.keys
+    }
 
     fun reconcile(connection: Connection, verifyOnly: Boolean = false) {
         for (spec in required) {
