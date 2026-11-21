@@ -165,7 +165,10 @@ fun serverModule(applicationDirs: ApplicationDirs): Module =
 fun applicationSetup() = applicationSetup {}
 
 @OptIn(DelicateCoroutinesApi::class)
-internal fun applicationSetup(onModulesReady: () -> Unit) {
+internal fun applicationSetup(
+    prepareDatabase: (ApplicationDirs) -> Unit = { suwayomi.tachidesk.server.database.EmbeddedDatabaseAdmission.prepare(it) },
+    onModulesReady: () -> Unit,
+) {
     Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
         KotlinLogging.logger {}.error(throwable) { "unhandled exception" }
     }
@@ -388,7 +391,7 @@ internal fun applicationSetup(onModulesReady: () -> Unit) {
 
     if (slimMode) {
         logger.info { "GoManga slim-mode: preparing the embedded database" }
-        suwayomi.tachidesk.server.database.EmbeddedDatabaseAdmission.prepare(applicationDirs)
+        prepareDatabase(applicationDirs)
         DBManager.setupDatabase()
     } else {
         runBlocking {

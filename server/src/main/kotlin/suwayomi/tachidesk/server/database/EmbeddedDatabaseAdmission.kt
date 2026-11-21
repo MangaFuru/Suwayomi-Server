@@ -7,10 +7,10 @@ import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.server.ApplicationDirs
-import suwayomi.tachidesk.server.database.migration.*
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.Path
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
@@ -18,19 +18,28 @@ import java.util.Properties
 import org.h2.Driver
 
 internal object EmbeddedDatabaseAdmission {
+    fun prepare(dirs: ApplicationDirs, legacyDriver: Path = packagedLegacyDriver()) =
+        prepareDuringSetup(dirs, legacyDriver) {}
+
+    // The read-only connection remains open through setup. Defer all writes,
+    // recovery and conversion locks until Android and extension services are ready.
     @OptIn(ExperimentalKeywordApi::class)
-    fun prepare(dirs: ApplicationDirs, legacyDriver: Path = packagedLegacyDriver()) {
+    fun prepareDuringSetup(
+        dirs: ApplicationDirs,
+        legacyDriver: Path = packagedLegacyDriver(),
+        awaitServerSetup: () -> Unit,
+    ) {
         val file = Path.of(dirs.dataRoot, "database.mv.db")
         require(Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) { "Expected existing database or packaged seed" }
-        val classes = registrations()
-        val names = classes.mapIndexed { index, type ->
-            val name = type.simpleName
+        val registrations = migrationClasses
+        val names = registrations.mapIndexed { index, name ->
             check(name.substringBefore('_').removePrefix("M").toInt() == index + 1)
             name.substringAfter('_')
         }
         val extensions = Path.of(dirs.extensionsRoot)
 
         fun migrate(path: Path) {
+            awaitServerSetup()
             require(';' !in path.toString())
             val database = Database.connect(
                 "jdbc:h2:${path.toAbsolutePath().toString().removeSuffix(".mv.db")};IFEXISTS=TRUE",
@@ -38,7 +47,10 @@ internal object EmbeddedDatabaseAdmission {
                 databaseConfig = DatabaseConfig { preserveKeywordCasing = false },
             )
             try {
-                val migrations = classes.map { it.getDeclaredConstructor().newInstance() }
+                val migrations = registrations.map { name ->
+                    Class.forName("suwayomi.tachidesk.server.database.migration.$name")
+                        .asSubclass(Migration::class.java).getDeclaredConstructor().newInstance()
+                }
                 EmbeddedSchemaRunner.upgrade(database, migrations) { step, connection ->
                     if (step.version == 60) EmbeddedProjectionNormalization.extensionPackages(connection) { pkg, apk, version ->
                         val jar = extensions.resolve(apk.substringBeforeLast('.') + ".jar").normalize()
@@ -57,6 +69,7 @@ internal object EmbeddedDatabaseAdmission {
         }
         val lockFile = file.resolveSibling(".gomanga-h2-conversion.lock")
         fun withConversionLock(action: () -> Unit) {
+            awaitServerSetup()
             FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { channel ->
                 checkNotNull(channel.tryLock()) { "Embedded database conversion is already active" }.use {
                     action()
@@ -71,14 +84,26 @@ internal object EmbeddedDatabaseAdmission {
                 setProperty("user", "")
                 setProperty("password", "")
             }
+            val originalRead = readOnly && path == file
+            fun identity() = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            val original = if (originalRead) identity() else null
             val mode = if (readOnly) ";ACCESS_MODE_DATA=r" else ""
             return Driver().connect("jdbc:h2:$database;IFEXISTS=TRUE;TRACE_LEVEL_FILE=0$mode", properties).use {
-                EmbeddedSchemaRunner.preflight(it, names)
+                val prefix = EmbeddedSchemaRunner.preflight(it, names)
+                if (originalRead) {
+                    awaitServerSetup()
+                    val current = identity()
+                    check(original != null && current.fileKey() == original.fileKey() &&
+                        current.size() == original.size() && current.lastModifiedTime() == original.lastModifiedTime()) {
+                        "Embedded database changed during read-only admission"
+                    }
+                }
+                prefix
             }
         }
         fun recover() = EmbeddedLegacyH2.recoverCurrent(file) { staged ->
-            if (inspect(staged, readOnly = false) < classes.size) migrate(staged)
-            check(inspect(staged, readOnly = true) == classes.size)
+            if (inspect(staged, readOnly = false) < registrations.size) migrate(staged)
+            check(inspect(staged, readOnly = true) == registrations.size)
         }
         fun admit(locked: Boolean) {
             when (fileFormat()) {
@@ -93,7 +118,7 @@ internal object EmbeddedDatabaseAdmission {
                         if (locked) recover() else withConversionLock(::recover)
                         return
                     }
-                    if (completed < classes.size) migrate(file)
+                    if (completed < registrations.size) migrate(file)
                 }
                 "format:1" -> {
                     EmbeddedDatabaseUpgradeProgress.convertingFormat()
@@ -112,73 +137,73 @@ internal object EmbeddedDatabaseAdmission {
     }
 
     // The iOS classpath may split migration classes across two JARs.
-    private fun registrations(): List<Class<out Migration>> = listOf(
-        M0001_Initial::class.java,
-        M0002_ChapterTableIndexRename::class.java,
-        M0003_DefaultCategory::class.java,
-        M0004_AnimeTablesBatch1::class.java,
-        M0005_AnimeTablesBatch2::class.java,
-        M0006_AnimeTablesBatch3::class.java,
-        M0007_ChapterIsDownloaded::class.java,
-        M0008_ChapterPageCount::class.java,
-        M0009_ChapterLastReadAt::class.java,
-        M0010_MangaAndChapterMeta::class.java,
-        M0011_SourceDropPartOfFactorySource::class.java,
-        M0012_SourceIsNsfw::class.java,
-        M0013_MangaRealUrl::class.java,
-        M0014_MangaRemoveLengthLimit::class.java,
-        M0015_SourceAndExtensionLangAddLengthLimit::class.java,
-        M0016_ChapterIndexRenameToSourceOrder::class.java,
-        M0017_ChapterFetchedAt::class.java,
-        M0018_MangaInLibraryAt::class.java,
-        M0019_RemoveAnime::class.java,
-        M0020_AddMangaLastFetchedAtColumns::class.java,
-        M0021_GlobalAndCategoryMeta::class.java,
-        M0022_MangaThumbnailLastFetched::class.java,
-        M0023_CategoryMetaRefFix::class.java,
-        M0024_MangaUpdateStrategy::class.java,
-        M0025_ChapterRealUrl::class.java,
-        M0026_CategoryIncludeInUpdate::class.java,
-        M0027_AddDefaultCategory::class.java,
-        M0028_AddCascade::class.java,
-        M0029_DropMangaDefaultCategory::class.java,
-        M0030_FixDateUpload::class.java,
-        M0031_AddExtensionRepo::class.java,
-        M0032_FixExtensionRepos::class.java,
-        M0033_TrackRecord::class.java,
-        M0034_CategoryIncludeInDownload::class.java,
-        M0035_TrackSearch::class.java,
-        M0036_SourceMeta::class.java,
-        M0037_RemoveTrackRecordsOfUnsupportedTrackers::class.java,
-        M0038_RemoveTrackRecordsOfUnsupportedTrackersII::class.java,
-        M0039_DeleteDuplicatedChapters::class.java,
-        M0040_AddUniqueConstraintToChapterTable::class.java,
-        M0041_FixDownloadedChaptersWithoutPageCount::class.java,
-        M0042_MangaRemoveLengthLimit_II::class.java,
-        M0043_PreventNegativeLastPageRead::class.java,
-        M0044_FixDownloadedChaptersWithoutPageCountII::class.java,
-        M0045_PreventDuplicatedChapterPages::class.java,
-        M0046_RenamePageImageUrlColumn::class.java,
-        M0047_ChapterScanlatorIncreaseLength::class.java,
-        M0048_AddTrackingColumns::class.java,
-        M0049_FixDuplicatedMetas::class.java,
-        M0050_FixHandlingOfTooLongPageImageUrls::class.java,
-        M0051_AddKoreaderHashToChapterTable::class.java,
-        M0052_RenameCategoryOrderColumn::class.java,
-        M0053_TrackersFixIds::class.java,
-        M0054_MovePostgresToSuwayomiSchema::class.java,
-        M0055_RenameMetaKeys::class.java,
-        M0056_SyncYomi::class.java,
-        M0057_AddNewExtensionApiFields::class.java,
-        M0058_AddExtensionStore::class.java,
-        M0059_AddJarUrlToExtensionTable::class.java,
-        M0060_MakeExtensionPkgNameUnique::class.java,
-        M0061_CreateForeignKeyIndexes::class.java,
-        M0062_PreventDuplicatedCategoryManga::class.java,
-        M0063_FixSyncYomiTriggers::class.java,
-        M0064_AddSyncFlags::class.java,
-        M0065_FixSecondsFallbackUploadDate::class.java,
-        M0066_GoMangaRuntimeCompatibilityV1::class.java,
+    private val migrationClasses = listOf(
+        "M0001_Initial",
+        "M0002_ChapterTableIndexRename",
+        "M0003_DefaultCategory",
+        "M0004_AnimeTablesBatch1",
+        "M0005_AnimeTablesBatch2",
+        "M0006_AnimeTablesBatch3",
+        "M0007_ChapterIsDownloaded",
+        "M0008_ChapterPageCount",
+        "M0009_ChapterLastReadAt",
+        "M0010_MangaAndChapterMeta",
+        "M0011_SourceDropPartOfFactorySource",
+        "M0012_SourceIsNsfw",
+        "M0013_MangaRealUrl",
+        "M0014_MangaRemoveLengthLimit",
+        "M0015_SourceAndExtensionLangAddLengthLimit",
+        "M0016_ChapterIndexRenameToSourceOrder",
+        "M0017_ChapterFetchedAt",
+        "M0018_MangaInLibraryAt",
+        "M0019_RemoveAnime",
+        "M0020_AddMangaLastFetchedAtColumns",
+        "M0021_GlobalAndCategoryMeta",
+        "M0022_MangaThumbnailLastFetched",
+        "M0023_CategoryMetaRefFix",
+        "M0024_MangaUpdateStrategy",
+        "M0025_ChapterRealUrl",
+        "M0026_CategoryIncludeInUpdate",
+        "M0027_AddDefaultCategory",
+        "M0028_AddCascade",
+        "M0029_DropMangaDefaultCategory",
+        "M0030_FixDateUpload",
+        "M0031_AddExtensionRepo",
+        "M0032_FixExtensionRepos",
+        "M0033_TrackRecord",
+        "M0034_CategoryIncludeInDownload",
+        "M0035_TrackSearch",
+        "M0036_SourceMeta",
+        "M0037_RemoveTrackRecordsOfUnsupportedTrackers",
+        "M0038_RemoveTrackRecordsOfUnsupportedTrackersII",
+        "M0039_DeleteDuplicatedChapters",
+        "M0040_AddUniqueConstraintToChapterTable",
+        "M0041_FixDownloadedChaptersWithoutPageCount",
+        "M0042_MangaRemoveLengthLimit_II",
+        "M0043_PreventNegativeLastPageRead",
+        "M0044_FixDownloadedChaptersWithoutPageCountII",
+        "M0045_PreventDuplicatedChapterPages",
+        "M0046_RenamePageImageUrlColumn",
+        "M0047_ChapterScanlatorIncreaseLength",
+        "M0048_AddTrackingColumns",
+        "M0049_FixDuplicatedMetas",
+        "M0050_FixHandlingOfTooLongPageImageUrls",
+        "M0051_AddKoreaderHashToChapterTable",
+        "M0052_RenameCategoryOrderColumn",
+        "M0053_TrackersFixIds",
+        "M0054_MovePostgresToSuwayomiSchema",
+        "M0055_RenameMetaKeys",
+        "M0056_SyncYomi",
+        "M0057_AddNewExtensionApiFields",
+        "M0058_AddExtensionStore",
+        "M0059_AddJarUrlToExtensionTable",
+        "M0060_MakeExtensionPkgNameUnique",
+        "M0061_CreateForeignKeyIndexes",
+        "M0062_PreventDuplicatedCategoryManga",
+        "M0063_FixSyncYomiTriggers",
+        "M0064_AddSyncFlags",
+        "M0065_FixSecondsFallbackUploadDate",
+        "M0066_GoMangaRuntimeCompatibilityV1",
     )
 
     private fun packagedLegacyDriver(): Path =

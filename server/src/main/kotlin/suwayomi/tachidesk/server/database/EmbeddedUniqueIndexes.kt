@@ -17,15 +17,27 @@ internal object EmbeddedUniqueIndexes {
     )
 
     fun ensureLookupIndexes(connection: Connection, verifyOnly: Boolean = false, allowMissing: Boolean = false) {
-        for ((table, columns) in indexes) for (column in columns) {
-            val name = "IDX_${table}_${column.removeSuffix("_REF").removeSuffix("_ID")}"
-            val fields = mutableListOf<String>()
-            connection.metaData.getIndexInfo(null, "PUBLIC", table, false, false).use { rows ->
-                while (rows.next()) if (rows.getString("INDEX_NAME") == name) {
-                    check(rows.getBoolean("NON_UNIQUE") && rows.getString("ASC_OR_DESC") != "D")
-                    fields += rows.getString("COLUMN_NAME")
+        val persisted = mutableMapOf<String, MutableList<String>>()
+        val invalid = mutableSetOf<String>()
+        connection.createStatement().use { statement ->
+            statement.executeQuery("""
+                SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, ORDERING_SPECIFICATION, IS_UNIQUE
+                FROM INFORMATION_SCHEMA.INDEX_COLUMNS
+                WHERE INDEX_SCHEMA='PUBLIC' AND TABLE_SCHEMA='PUBLIC'
+                ORDER BY INDEX_NAME, ORDINAL_POSITION
+            """).use { rows ->
+                while (rows.next()) {
+                    val key = rows.getString(1) + "." + rows.getString(2)
+                    persisted.getOrPut(key) { mutableListOf() }.add(rows.getString(3))
+                    if (rows.getString(4) == "DESC" || rows.getBoolean(5)) invalid.add(key)
                 }
             }
+        }
+        for ((table, columns) in indexes) for (column in columns) {
+            val name = "IDX_${table}_${column.removeSuffix("_REF").removeSuffix("_ID")}"
+            val key = "$table.$name"
+            val fields = persisted[key].orEmpty()
+            check(key !in invalid) { "Unexpected embedded lookup index $name" }
             if (fields.isEmpty() && allowMissing) continue
             if (fields.isEmpty() && !verifyOnly) {
                 connection.createStatement().use { it.execute("CREATE INDEX $name ON $table ($column)") }

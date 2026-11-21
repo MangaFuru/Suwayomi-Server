@@ -71,23 +71,25 @@ internal object EmbeddedSyncTriggers {
     }
 
     fun reconcile(connection: Connection, verifyOnly: Boolean = false) {
-        for (spec in required) {
-            val events = mutableSetOf<String>()
-            var definitionMatches = true
-            connection.prepareStatement("""
-                SELECT EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, JAVA_CLASS, ACTION_ORIENTATION
-                FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA='PUBLIC' AND TRIGGER_NAME=?
-            """).use { statement ->
-                statement.setString(1, spec.name)
-                statement.executeQuery().use { rows ->
-                    while (rows.next()) {
-                        events += rows.getString(3)
-                        definitionMatches = definitionMatches && rows.getString(1) == spec.table &&
-                            rows.getString(2) == spec.timing && rows.getString(4) == spec.handler && rows.getString(5) == "ROW"
-                    }
+        val persisted = mutableMapOf<String, MutableSet<String>>()
+        val invalid = mutableSetOf<String>()
+        val expected = required.associateBy { it.name }
+        connection.createStatement().use { statement ->
+            statement.executeQuery("""
+                SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, JAVA_CLASS, ACTION_ORIENTATION
+                FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA='PUBLIC'
+            """).use { rows ->
+                while (rows.next()) {
+                    val spec = expected[rows.getString(1)] ?: continue
+                    persisted.getOrPut(spec.name) { mutableSetOf() }.add(rows.getString(4))
+                    if (rows.getString(2) != spec.table || rows.getString(3) != spec.timing ||
+                        rows.getString(5) != spec.handler || rows.getString(6) != "ROW") invalid.add(spec.name)
                 }
             }
-            if (definitionMatches && events == spec.events) continue
+        }
+        for (spec in required) {
+            val events = persisted[spec.name].orEmpty()
+            if (spec.name !in invalid && events == spec.events) continue
             check(!verifyOnly) { "Incomplete embedded trigger ${spec.name}" }
             connection.createStatement().use { sql ->
                 if (events.isNotEmpty()) sql.execute("DROP TRIGGER PUBLIC.${spec.name}")
