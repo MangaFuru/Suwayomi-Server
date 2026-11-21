@@ -13,7 +13,10 @@ import suwayomi.tachidesk.server.applicationSetup
 
 fun main() {
     // Trigger graphql schema generation as early as possible, takes multiple seconds, delaying the javalin startup otherwise
-    GraphQLSchemaProvider.init()
+    if (!java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.slimMode") ||
+        java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.graphqlEnabled")) {
+        GraphQLSchemaProvider.init()
+    }
     applicationSetup()
     javalinSetup()
 }

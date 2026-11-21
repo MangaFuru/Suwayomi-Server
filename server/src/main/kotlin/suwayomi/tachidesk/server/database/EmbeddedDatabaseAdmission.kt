@@ -14,7 +14,8 @@ import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
-import java.sql.DriverManager
+import java.util.Properties
+import org.h2.Driver
 
 internal object EmbeddedDatabaseAdmission {
     @OptIn(ExperimentalKeywordApi::class)
@@ -53,7 +54,11 @@ internal object EmbeddedDatabaseAdmission {
                 "format:3" -> {
                     val path = file.toAbsolutePath().toString().removeSuffix(".mv.db")
                     require(';' !in path)
-                    DriverManager.getConnection("jdbc:h2:$path;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0", "", "").use {
+                    val properties = Properties().apply {
+                        setProperty("user", "")
+                        setProperty("password", "")
+                    }
+                    Driver().connect("jdbc:h2:$path;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0", properties).use {
                         EmbeddedSchemaRunner.preflight(it, migrations)
                     }
                     migrate(file)
