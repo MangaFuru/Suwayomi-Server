@@ -17,6 +17,21 @@ class HistoricalAdmissionTest : ApplicationTest() {
     @Test fun h22Admission() = verify("v1.0.34")
     @Test fun h23Admission() = verify("v1.1.21")
 
+    @Test fun failedRecoveryDoesNotPromoteOrRemoveTheOriginal() {
+        val source = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), "v1.1.21", "database.mv.db")
+        val original = Files.copy(source, root.resolve("database.mv.db"))
+        val failure = runCatching {
+            EmbeddedLegacyH2.recoverCurrent(original) { staged ->
+                check(staged != original && Files.mismatch(staged, original) == -1L)
+                Files.writeString(staged, "incomplete recovered database")
+                error("Rejected staged schema")
+            }
+        }.exceptionOrNull()
+        check(failure?.message == "Rejected staged schema")
+        check(Files.mismatch(original, source) == -1L)
+        Files.list(root).use { files -> check(files.toList() == listOf(original)) }
+    }
+
     @Test fun incompatibleFlagDoesNotChangeInput() {
         val source = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), "v1.1.21", "database.mv.db")
         val input = Files.copy(source, root.resolve("database.mv.db"))

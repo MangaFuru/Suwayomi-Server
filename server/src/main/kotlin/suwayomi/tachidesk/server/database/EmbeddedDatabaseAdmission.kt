@@ -49,19 +49,44 @@ internal object EmbeddedDatabaseAdmission {
             val header = Files.newInputStream(file).use { String(it.readNBytes(512), Charsets.US_ASCII).substringBefore('\n') }
             return header.split(',').singleOrNull { it.startsWith("format:") }
         }
-        fun admit() {
+        val lockFile = file.resolveSibling(".gomanga-h2-conversion.lock")
+        fun withConversionLock(action: () -> Unit) {
+            FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { channel ->
+                checkNotNull(channel.tryLock()) { "Embedded database conversion is already active" }.use {
+                    action()
+                    EmbeddedLegacyH2.removeAbandonedWorkspaces(file)
+                }
+            }
+        }
+        fun inspect(path: Path, readOnly: Boolean): Int {
+            val database = path.toAbsolutePath().toString().removeSuffix(".mv.db")
+            require(';' !in database)
+            val properties = Properties().apply {
+                setProperty("user", "")
+                setProperty("password", "")
+            }
+            val mode = if (readOnly) ";ACCESS_MODE_DATA=r" else ""
+            return Driver().connect("jdbc:h2:$database;IFEXISTS=TRUE;TRACE_LEVEL_FILE=0$mode", properties).use {
+                EmbeddedSchemaRunner.preflight(it, migrations)
+            }
+        }
+        fun recover() = EmbeddedLegacyH2.recoverCurrent(file) { staged ->
+            if (inspect(staged, readOnly = false) < migrations.size) migrate(staged)
+            check(inspect(staged, readOnly = true) == migrations.size)
+        }
+        fun admit(locked: Boolean) {
             when (fileFormat()) {
                 "format:3" -> {
-                    val path = file.toAbsolutePath().toString().removeSuffix(".mv.db")
-                    require(';' !in path)
-                    val properties = Properties().apply {
-                        setProperty("user", "")
-                        setProperty("password", "")
+                    val completed = try {
+                        inspect(file, readOnly = true)
+                    } catch (error: java.sql.SQLException) {
+                        val needsRecovery = generateSequence<Throwable>(error) { it.cause }
+                            .filterIsInstance<org.h2.mvstore.MVStoreException>()
+                            .any { it.message?.startsWith("This store is read-only [") == true }
+                        if (!needsRecovery) throw error
+                        if (locked) recover() else withConversionLock(::recover)
+                        return
                     }
-                    val completed = Driver().connect("jdbc:h2:$path;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0", properties).use {
-                        EmbeddedSchemaRunner.preflight(it, migrations)
-                    }
-                    // The read-only preflight already validated every registered receipt and final schema invariant.
                     if (completed < migrations.size) migrate(file)
                 }
                 "format:1" -> {
@@ -73,16 +98,10 @@ internal object EmbeddedDatabaseAdmission {
             }
         }
 
-        val lockFile = file.resolveSibling(".gomanga-h2-conversion.lock")
         if (fileFormat() == "format:1" || Files.exists(lockFile, LinkOption.NOFOLLOW_LINKS)) {
-            FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { channel ->
-                checkNotNull(channel.tryLock()) { "Embedded format conversion is already active" }.use {
-                    admit()
-                    EmbeddedLegacyH2.removeAbandonedWorkspaces(file)
-                }
-            }
+            withConversionLock { admit(locked = true) }
         } else {
-            admit()
+            admit(locked = false)
         }
     }
 

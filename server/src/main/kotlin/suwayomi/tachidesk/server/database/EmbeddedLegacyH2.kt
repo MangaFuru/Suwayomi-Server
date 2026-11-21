@@ -36,17 +36,9 @@ internal object EmbeddedLegacyH2 {
         }
         check(digest(bundledLegacyDriver) == LEGACY_SHA256) { "Bundled legacy H2 driver identity mismatch" }
         check(';' !in original.toAbsolutePath().toString()) { "Unsupported legacy database path" }
-        val before = digest(original)
-        val workspace = original.parent.resolve(".gomanga-h2-" + UUID.randomUUID())
-        Files.createDirectory(workspace)
-        try {
-            // Only the converter writes this marker. Name, original digest, and
-            // the closed set of owned files also fence later cleanup after a crash.
-            Files.writeString(workspace.resolve("owner"), "gomanga-h2-v1\n${workspace.fileName}\n$before\n",
-                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.SYNC)
+        replaceFromStagedCopy(original) { workspace, staged ->
             val export = workspace.resolve("legacy.sql")
             val normalized = workspace.resolve("import.sql")
-            val staged = workspace.resolve("database.mv.db")
             val properties = Properties()
             properties.setProperty("user", "")
             properties.setProperty("password", "")
@@ -89,7 +81,34 @@ internal object EmbeddedLegacyH2 {
             }
             Files.delete(input)
             migrateStaged(staged)
-            check(digest(original) == before) { "Legacy database changed during conversion" }
+        }
+    }
+
+    /** An unclean current-engine store can need a writable recovery even to read its ledger.
+     * Only promote its recovered copy after the ordinary schema checks and migrations succeed. */
+    fun recoverCurrent(original: Path, admitStaged: (Path) -> Unit) {
+        val size = Files.size(original)
+        check(Files.getFileStore(original.parent).usableSpace >= Math.addExact(Math.multiplyExact(size, 2L), 32L * 1024 * 1024)) {
+            "Insufficient free space for embedded database recovery"
+        }
+        replaceFromStagedCopy(original) { _, staged ->
+            Files.copy(original, staged)
+            admitStaged(staged)
+        }
+    }
+
+    private fun replaceFromStagedCopy(original: Path, prepare: (Path, Path) -> Unit) {
+        val before = digest(original)
+        val workspace = original.parent.resolve(".gomanga-h2-" + UUID.randomUUID())
+        Files.createDirectory(workspace)
+        try {
+            // Only the converter writes this marker. Name, original digest, and
+            // the closed set of owned files also fence later cleanup after a crash.
+            Files.writeString(workspace.resolve("owner"), "gomanga-h2-v1\n${workspace.fileName}\n$before\n",
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.SYNC)
+            val staged = workspace.resolve("database.mv.db")
+            prepare(workspace, staged)
+            check(digest(original) == before) { "Original database changed during staged admission" }
             FileChannel.open(staged, StandardOpenOption.WRITE).use { it.force(true) }
             Files.move(staged, original, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } finally {
