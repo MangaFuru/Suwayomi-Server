@@ -1,7 +1,6 @@
 package suwayomi.tachidesk.server.database.trigger
 
 import org.h2.tools.TriggerAdapter
-import suwayomi.tachidesk.server.database.EmbeddedSyncTriggers
 import java.sql.Connection
 import java.sql.ResultSet
 import kotlin.random.Random
@@ -34,7 +33,6 @@ class UpdateChapterAndMangaVersionTrigger : TriggerAdapter() {
         oldRow: ResultSet,
         newRow: ResultSet,
     ) {
-        if (EmbeddedSyncTriggers.chapterTimestampMigrationActive()) return
         val isSyncing = newRow.getBoolean("is_syncing")
         val hasChanged =
             oldRow.getBoolean("read") != newRow.getBoolean("read") ||
@@ -78,7 +76,6 @@ class UpdateChapterLastModifiedAtTrigger : TriggerAdapter() {
         oldRow: ResultSet?,
         newRow: ResultSet,
     ) {
-        if (EmbeddedSyncTriggers.chapterTimestampMigrationActive()) return
         newRow.stampLastModifiedAt(oldRow, listOf("read", "bookmark", "last_page_read", "version"))
     }
 }

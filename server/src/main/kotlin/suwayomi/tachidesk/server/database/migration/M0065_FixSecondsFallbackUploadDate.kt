@@ -12,7 +12,10 @@ import de.neonew.exposed.migrations.helpers.SQLMigration
 // New chapters without an upload date fell back to the fetch time in seconds instead of
 // milliseconds. 10^11 ms is March 1973 while 10^11 s is the year 5138, so every value in
 // that range is a seconds timestamp. date_upload is not a synced column, so the SyncYomi
-// version and last_modified_at triggers don't fire.
+// version and last_modified_at triggers don't fire. The predicate intentionally bounds the
+// timestamp value, never the sparse chapter ID; it is safe for negative and Int.MAX IDs. The
+// migration ledger makes this one-shot, so ordinary re-admission cannot double-convert values
+// such as 1.
 @Suppress("ClassName", "unused")
 class M0065_FixSecondsFallbackUploadDate : SQLMigration() {
     // language=sql

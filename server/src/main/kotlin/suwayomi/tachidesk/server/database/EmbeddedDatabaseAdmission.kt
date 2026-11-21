@@ -18,6 +18,11 @@ import java.util.Properties
 import org.h2.Driver
 
 internal object EmbeddedDatabaseAdmission {
+    // A current root with at least this many chapters is copied to a private workspace before the
+    // pending M0065 bulk UPDATE. Row cardinality, rather than file size, catches compact H23
+    // stores and avoids staging tiny roots. The threshold is explicit for capacity planning.
+    private const val LARGE_M0065_STAGE_ROWS = 5_000
+
     fun prepare(dirs: ApplicationDirs, legacyDriver: Path = packagedLegacyDriver()) =
         prepareDuringSetup(dirs, legacyDriver) {}
 
@@ -38,7 +43,7 @@ internal object EmbeddedDatabaseAdmission {
         }
         val extensions = Path.of(dirs.extensionsRoot)
 
-        fun migrate(path: Path) {
+        fun migrate(path: Path, privateStage: Boolean = false) {
             awaitServerSetup()
             require(';' !in path.toString())
             val database = Database.connect(
@@ -51,7 +56,7 @@ internal object EmbeddedDatabaseAdmission {
                     Class.forName("suwayomi.tachidesk.server.database.migration.$name")
                         .asSubclass(Migration::class.java).getDeclaredConstructor().newInstance()
                 }
-                EmbeddedSchemaRunner.upgrade(database, migrations) { step, connection ->
+                EmbeddedSchemaRunner.upgrade(database, migrations, privateStage) { step, connection ->
                     if (step.version == 60) EmbeddedProjectionNormalization.extensionPackages(connection) { pkg, apk, version ->
                         val jar = extensions.resolve(apk.substringBeforeLast('.') + ".jar").normalize()
                         if (jar.parent != extensions || !Files.isRegularFile(jar, LinkOption.NOFOLLOW_LINKS)) false
@@ -102,8 +107,22 @@ internal object EmbeddedDatabaseAdmission {
             }
         }
         fun recover() = EmbeddedLegacyH2.recoverCurrent(file) { staged ->
-            if (inspect(staged, readOnly = false) < registrations.size) migrate(staged)
+            if (inspect(staged, readOnly = false) < registrations.size) migrate(staged, privateStage = true)
             check(inspect(staged, readOnly = true) == registrations.size)
+        }
+
+        fun hasLargeCurrentRoot(path: Path): Boolean {
+            val database = path.toAbsolutePath().toString().removeSuffix(".mv.db")
+            return Driver().connect(
+                "jdbc:h2:$database;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0",
+                Properties().apply { setProperty("user", ""); setProperty("password", "") },
+            ).use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.executeQuery(
+                        "SELECT ID FROM CHAPTER OFFSET ${LARGE_M0065_STAGE_ROWS - 1} ROWS FETCH NEXT 1 ROW ONLY",
+                    ).use { it.next() }
+                }
+            }
         }
         fun admit(locked: Boolean) {
             when (fileFormat()) {
@@ -118,12 +137,18 @@ internal object EmbeddedDatabaseAdmission {
                         if (locked) recover() else withConversionLock(::recover)
                         return
                     }
-                    if (completed < registrations.size) migrate(file)
+                    if (completed < registrations.size) {
+                        if (completed <= 64 && hasLargeCurrentRoot(file)) {
+                            if (locked) recover() else withConversionLock(::recover)
+                        } else {
+                            migrate(file)
+                        }
+                    }
                 }
                 "format:1" -> {
                     EmbeddedDatabaseUpgradeProgress.convertingFormat()
                     val budget = Math.addExact(Math.multiplyExact(Files.size(file), 4L), 32L * 1024 * 1024)
-                    EmbeddedLegacyH2.convert(file, legacyDriver, budget, null, names, ::migrate)
+                    EmbeddedLegacyH2.convert(file, legacyDriver, budget, null, names) { staged -> migrate(staged, privateStage = true) }
                 }
                 else -> error("Unsupported embedded database file format")
             }

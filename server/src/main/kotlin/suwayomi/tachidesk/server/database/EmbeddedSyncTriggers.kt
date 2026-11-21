@@ -4,8 +4,6 @@ import java.sql.Connection
 
 /** Reconcile only trigger names owned by the shipped H2 migrations. */
 internal object EmbeddedSyncTriggers {
-    private val chapterTimestampMigration = ThreadLocal.withInitial { false }
-
     private data class Spec(val name: String, val table: String, val timing: String, val events: Set<String>, val handler: String)
     private fun spec(name: String, table: String, timing: String, events: String, handler: String) =
         Spec(name, table, timing, events.split(",").toSet(), "suwayomi.tachidesk.server.database.trigger.${handler}Trigger")
@@ -24,50 +22,63 @@ internal object EmbeddedSyncTriggers {
         spec("UPDATE_CATEGORY_VERSION", "CATEGORY", "BEFORE", "UPDATE", "UpdateCategoryVersion"),
     )
 
+    private data class ChapterTrigger(
+        val name: String,
+        val table: String,
+        val timing: String,
+        val event: String,
+        val handler: String?,
+        val orientation: String?,
+    )
+
     /**
-     * M0065 changes only chapter.date_upload. Guard the two shipped chapter UPDATE handlers
-     * while it runs, but only when their persisted H2 definitions are exactly ours. This avoids
-     * per-row Kotlin trigger work without disabling an extension/user trigger or changing retry
-     * and receipt behavior.
+     * M0065 changes only chapter.date_upload. For a known H2 catalog, remove only the two
+     * shipped chapter UPDATE triggers for the one bulk UPDATE, and restore them in M0066 before promotion. Unknown chapter UPDATE triggers deliberately take
+     * the ordinary whole-UPDATE path so extension/user behavior is unchanged.
      */
     fun <T> withChapterTimestampMigration(connection: Connection, action: () -> T): T {
-        if (connection.metaData.databaseProductName != "H2" || !hasExpectedChapterUpdateTriggers(connection)) {
+        if (connection.metaData.databaseProductName != "H2" || !hasExactChapterTimestampCatalog(connection)) {
             return action()
         }
-        chapterTimestampMigration.set(true)
-        return try {
-            action()
-        } finally {
-            chapterTimestampMigration.remove()
+        connection.createStatement().use { statement ->
+            statement.execute("DROP TRIGGER PUBLIC.UPDATE_CHAPTER_AND_MANGA_VERSION")
+            statement.execute("DROP TRIGGER PUBLIC.UPDATE_CHAPTER_LAST_MODIFIED_AT")
         }
+        // M0066 restores the owned definitions before the private file can be promoted.
+        return action()
     }
 
-    internal fun chapterTimestampMigrationActive(): Boolean = chapterTimestampMigration.get()
-
-    private fun hasExpectedChapterUpdateTriggers(connection: Connection): Boolean {
-        val expected = mapOf(
-            "UPDATE_CHAPTER_AND_MANGA_VERSION" to "suwayomi.tachidesk.server.database.trigger.UpdateChapterAndMangaVersionTrigger",
-            "UPDATE_CHAPTER_LAST_MODIFIED_AT" to "suwayomi.tachidesk.server.database.trigger.UpdateChapterLastModifiedAtTrigger",
+    private fun hasExactChapterTimestampCatalog(connection: Connection): Boolean {
+        val expected = setOf(
+            ChapterTrigger(
+                "UPDATE_CHAPTER_AND_MANGA_VERSION", "CHAPTER", "BEFORE", "UPDATE",
+                "suwayomi.tachidesk.server.database.trigger.UpdateChapterAndMangaVersionTrigger", "ROW",
+            ),
+            ChapterTrigger(
+                "UPDATE_CHAPTER_LAST_MODIFIED_AT", "CHAPTER", "BEFORE", "UPDATE",
+                "suwayomi.tachidesk.server.database.trigger.UpdateChapterLastModifiedAtTrigger", "ROW",
+            ),
         )
-        val seen = mutableSetOf<String>()
+        val catalog = mutableListOf<ChapterTrigger>()
         connection.prepareStatement("""
             SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, JAVA_CLASS, ACTION_ORIENTATION
             FROM INFORMATION_SCHEMA.TRIGGERS
-            WHERE TRIGGER_SCHEMA='PUBLIC' AND EVENT_OBJECT_TABLE='CHAPTER' AND EVENT_MANIPULATION='UPDATE'
+            WHERE TRIGGER_SCHEMA='PUBLIC' AND EVENT_OBJECT_TABLE='CHAPTER'
         """).use { statement ->
             statement.executeQuery().use { rows ->
                 while (rows.next()) {
-                    val name = rows.getString("TRIGGER_NAME")
-                    if (rows.getString("EVENT_OBJECT_TABLE") == "CHAPTER" &&
-                        rows.getString("ACTION_TIMING") == "BEFORE" &&
-                        rows.getString("EVENT_MANIPULATION") == "UPDATE" &&
-                        rows.getString("JAVA_CLASS") == expected[name] &&
-                        rows.getString("ACTION_ORIENTATION") == "ROW"
-                    ) seen += name else return false
+                    catalog += ChapterTrigger(
+                        rows.getString("TRIGGER_NAME"), rows.getString("EVENT_OBJECT_TABLE"),
+                        rows.getString("ACTION_TIMING"), rows.getString("EVENT_MANIPULATION"),
+                        rows.getString("JAVA_CLASS"), rows.getString("ACTION_ORIENTATION"),
+                    )
                 }
             }
         }
-        return seen == expected.keys
+        val ownedNames = expected.map { it.name }.toSet()
+        val owned = catalog.filter { it.name in ownedNames }.toSet()
+        val unknownUpdate = catalog.any { it.event == "UPDATE" && it !in expected }
+        return owned == expected && !unknownUpdate
     }
 
     fun reconcile(connection: Connection, verifyOnly: Boolean = false) {
@@ -89,6 +100,9 @@ internal object EmbeddedSyncTriggers {
         }
         for (spec in required) {
             val events = persisted[spec.name].orEmpty()
+            check(events.all { it in spec.events }) {
+                "Unknown event on embedded trigger ${spec.name}"
+            }
             if (spec.name !in invalid && events == spec.events) continue
             check(!verifyOnly) { "Incomplete embedded trigger ${spec.name}" }
             connection.createStatement().use { sql ->
