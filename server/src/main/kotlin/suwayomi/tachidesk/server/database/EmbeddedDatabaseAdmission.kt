@@ -58,10 +58,11 @@ internal object EmbeddedDatabaseAdmission {
                         setProperty("user", "")
                         setProperty("password", "")
                     }
-                    Driver().connect("jdbc:h2:$path;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0", properties).use {
+                    val completed = Driver().connect("jdbc:h2:$path;IFEXISTS=TRUE;ACCESS_MODE_DATA=r;TRACE_LEVEL_FILE=0", properties).use {
                         EmbeddedSchemaRunner.preflight(it, migrations)
                     }
-                    migrate(file)
+                    // The read-only preflight already validated every registered receipt and final schema invariant.
+                    if (completed < migrations.size) migrate(file)
                 }
                 "format:1" -> {
                     EmbeddedDatabaseUpgradeProgress.convertingFormat()
