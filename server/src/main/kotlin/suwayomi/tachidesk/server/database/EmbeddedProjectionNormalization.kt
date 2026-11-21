@@ -123,6 +123,7 @@ internal object EmbeddedProjectionNormalization {
             check(columns(connection, "CATEGORYMANGA") == setOf("ID", "MANGA", "CATEGORY")) {
                 "Cannot collapse duplicate memberships with additional columns"
             }
+            EmbeddedDuplicateReferences.reconcileMemberships(connection)
             sql.executeUpdate(
                 "DELETE FROM CATEGORYMANGA WHERE ID NOT IN (SELECT MIN(ID) FROM CATEGORYMANGA GROUP BY MANGA, CATEGORY)",
             )

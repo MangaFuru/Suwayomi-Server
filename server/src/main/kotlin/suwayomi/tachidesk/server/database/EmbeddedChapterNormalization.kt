@@ -33,6 +33,9 @@ internal object EmbeddedChapterNormalization {
                 ).use { check(!it.next()) { "Conflicting persisted fields on duplicate legacy chapters" } }
             }
 
+            EmbeddedDuplicateReferences.requireMapped(connection, "CHAPTER",
+                "SELECT original.ID FROM CHAPTER original JOIN CHAPTER keeper ON $sameChapter AND original.ID > keeper.ID",
+                mapOf("PAGE" to "CHAPTER", "CHAPTERMETA" to "CHAPTER_REF"))
             EmbeddedMetadataConflicts.captureChapterGroups(connection)
 
             sql.executeUpdate(

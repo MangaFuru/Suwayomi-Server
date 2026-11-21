@@ -15,6 +15,7 @@ internal object EmbeddedMetadataConflicts {
             "CATEGORYMETA" to "CATEGORY_REF", "CHAPTERMETA" to "CHAPTER_REF",
             "GLOBALMETA" to null, "MANGAMETA" to "MANGA_REF", "SOURCEMETA" to "SOURCE_REF",
         )) {
+            EmbeddedDuplicateReferences.verifyDeduplication(connection, table, listOfNotNull(owner, "KEY"), setOf("VALUE"))
             capture(connection, table, owner, "SELECT m.*, ${owner ?: "CAST(NULL AS BIGINT)"} AS TARGET_OWNER FROM $table m")
         }
     }

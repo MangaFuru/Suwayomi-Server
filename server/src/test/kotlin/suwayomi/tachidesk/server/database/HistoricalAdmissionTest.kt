@@ -31,6 +31,28 @@ class HistoricalAdmissionTest : ApplicationTest() {
         check(Files.readAllBytes(input).contentEquals(before))
     }
 
+    @Test fun membershipDependentSurvivesDeduplicationAndReopen() {
+        val fixture = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), "v1.1.21", "duplicate-projections.mv.db")
+        Files.copy(fixture, root.resolve("database.mv.db"))
+        val url = "jdbc:h2:${root.resolve("database")};IFEXISTS=TRUE"
+        DriverManager.getConnection(url, "", "").use { db ->
+            db.createStatement().use { sql ->
+                sql.execute("CREATE TABLE EXTRA_MEMBER_NOTE (MEMBER_ID INT REFERENCES CATEGORYMANGA(ID) ON DELETE CASCADE, NOTE VARCHAR)")
+                sql.execute("INSERT INTO EXTRA_MEMBER_NOTE VALUES (913, 'preserve')")
+            }
+        }
+        repeat(3) {
+            EmbeddedDatabaseAdmission.prepare(ApplicationDirs(root.toString()), Path.of(System.getenv("GOMANGA_VERIFICATION_H2_DRIVER")))
+            DriverManager.getConnection(url, "", "").use { db ->
+                db.createStatement().use { sql ->
+                    sql.executeQuery("SELECT M.ID, N.NOTE FROM EXTRA_MEMBER_NOTE N JOIN CATEGORYMANGA M ON M.ID=N.MEMBER_ID").use { row ->
+                        check(row.next() && row.getInt(1) == 905 && row.getString(2) == "preserve" && !row.next())
+                    }
+                }
+            }
+        }
+    }
+
     private fun verify(version: String) {
         val source = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), version, "database.mv.db")
         Files.copy(source, root.resolve("database.mv.db"))

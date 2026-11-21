@@ -67,6 +67,7 @@ internal object EmbeddedSchemaRunner {
                     val connection = connection.connection as Connection
                     when (migration.version) {
                         39 -> EmbeddedChapterNormalization.beforeDuplicateRemoval(connection)
+                        45 -> EmbeddedDuplicateReferences.verifyDeduplication(connection, "PAGE", listOf("INDEX", "imageUrl", "CHAPTER"))
                         49 -> EmbeddedMetadataConflicts.captureMetadataGroups(connection)
                     }
                     beforeMigration(migration, connection)
