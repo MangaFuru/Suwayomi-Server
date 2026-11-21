@@ -33,10 +33,11 @@ internal object EmbeddedSyncTriggers {
 
     /**
      * M0065 changes only chapter.date_upload. For a known H2 catalog, remove only the two
-     * shipped chapter UPDATE triggers for the one bulk UPDATE, and restore them in M0066 before promotion. Unknown chapter UPDATE triggers deliberately take
+     * shipped chapter UPDATE triggers during the private copy update. M0066 restores them
+     * before promotion. Unknown chapter UPDATE triggers take
      * the ordinary whole-UPDATE path so extension/user behavior is unchanged.
      */
-    fun <T> withChapterTimestampMigration(connection: Connection, action: () -> T): T {
+    fun withChapterTimestampMigration(connection: Connection, action: () -> Unit) {
         if (connection.metaData.databaseProductName != "H2" || !hasExactChapterTimestampCatalog(connection)) {
             return action()
         }
@@ -44,8 +45,26 @@ internal object EmbeddedSyncTriggers {
             statement.execute("DROP TRIGGER PUBLIC.UPDATE_CHAPTER_AND_MANGA_VERSION")
             statement.execute("DROP TRIGGER PUBLIC.UPDATE_CHAPTER_LAST_MODIFIED_AT")
         }
-        // M0066 restores the owned definitions before the private file can be promoted.
-        return action()
+        // Each committed page belongs to the private copy. Admission discards
+        // that copy if interrupted and M0066 restores the triggers before promotion.
+        val boundary = "SELECT ID FROM CHAPTER WHERE ID >= ? ORDER BY ID OFFSET 2047 ROWS FETCH NEXT 1 ROW ONLY"
+        val update = """UPDATE CHAPTER SET DATE_UPLOAD = DATE_UPLOAD * 1000
+            WHERE ID BETWEEN ? AND ? AND DATE_UPLOAD > 0 AND DATE_UPLOAD < 100000000000"""
+        connection.prepareStatement(boundary).use { next ->
+            connection.prepareStatement(update).use { batch ->
+                var first = Long.MIN_VALUE
+                while (true) {
+                    next.setLong(1, first)
+                    val last = next.executeQuery().use { if (it.next()) it.getLong(1) else Long.MAX_VALUE }
+                    batch.setLong(1, first)
+                    batch.setLong(2, last)
+                    batch.executeUpdate()
+                    connection.commit()
+                    if (last == Long.MAX_VALUE) break
+                    first = last + 1
+                }
+            }
+        }
     }
 
     private fun hasExactChapterTimestampCatalog(connection: Connection): Boolean {
