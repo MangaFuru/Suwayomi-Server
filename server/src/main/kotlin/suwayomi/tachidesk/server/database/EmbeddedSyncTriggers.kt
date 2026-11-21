@@ -53,10 +53,8 @@ internal object EmbeddedSyncTriggers {
         connection.prepareStatement("""
             SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, JAVA_CLASS, ACTION_ORIENTATION
             FROM INFORMATION_SCHEMA.TRIGGERS
-            WHERE TRIGGER_SCHEMA='PUBLIC' AND TRIGGER_NAME IN (?, ?)
+            WHERE TRIGGER_SCHEMA='PUBLIC' AND EVENT_OBJECT_TABLE='CHAPTER' AND EVENT_MANIPULATION='UPDATE'
         """).use { statement ->
-            statement.setString(1, expected.keys.elementAt(0))
-            statement.setString(2, expected.keys.elementAt(1))
             statement.executeQuery().use { rows ->
                 while (rows.next()) {
                     val name = rows.getString("TRIGGER_NAME")
@@ -65,7 +63,7 @@ internal object EmbeddedSyncTriggers {
                         rows.getString("EVENT_MANIPULATION") == "UPDATE" &&
                         rows.getString("JAVA_CLASS") == expected[name] &&
                         rows.getString("ACTION_ORIENTATION") == "ROW"
-                    ) seen += name
+                    ) seen += name else return false
                 }
             }
         }
