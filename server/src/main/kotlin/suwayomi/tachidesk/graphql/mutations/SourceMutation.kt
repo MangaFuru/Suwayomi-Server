@@ -328,7 +328,7 @@ class SourceMutation {
         val (clientMutationId, sourceId, change) = input
 
         return future {
-            Source.setSourcePreference(sourceId, change.position, "") { preference ->
+            val result = Source.setSourcePreference(sourceId, change.position, "") { preference ->
                 when (preference) {
                     is SwitchPreferenceCompat -> change.switchState
                     is CheckBoxPreference -> change.checkBoxState
@@ -337,6 +337,9 @@ class SourceMutation {
                     is MultiSelectListPreference -> change.multiSelectState?.toSet()
                     else -> throw RuntimeException("sealed class cannot have more subtypes!")
                 } ?: throw Exception("Expected change to ${preference::class.simpleName}")
+            }
+            if (result.status != "accepted") {
+                throw IllegalArgumentException(result.code ?: "source_preference_update_failed")
             }
 
             UpdateSourcePreferencePayload(

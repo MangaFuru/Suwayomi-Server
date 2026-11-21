@@ -1,0 +1,52 @@
+package suwayomi.tachidesk.server.database
+
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable
+import org.junit.jupiter.api.io.TempDir
+import suwayomi.tachidesk.server.ApplicationDirs
+import suwayomi.tachidesk.test.ApplicationTest
+import java.nio.file.Files
+import java.nio.file.Path
+import java.sql.DriverManager
+
+@EnabledIfEnvironmentVariable(named = "GOMANGA_VERIFICATION_FIXTURES", matches = ".+")
+class HistoricalAdmissionTest : ApplicationTest() {
+    @TempDir lateinit var root: Path
+
+    @Test fun h38Admission() = verify("v0.5.34")
+    @Test fun h22Admission() = verify("v1.0.34")
+    @Test fun h23Admission() = verify("v1.1.21")
+
+    @Test fun incompatibleFlagDoesNotChangeInput() {
+        val source = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), "v1.1.21", "database.mv.db")
+        val input = Files.copy(source, root.resolve("database.mv.db"))
+        val url = "jdbc:h2:${root.resolve("database")};IFEXISTS=TRUE"
+        DriverManager.getConnection(url, "", "").use { db ->
+            db.createStatement().use { it.execute("ALTER TABLE CATEGORY ADD FLAGS VARCHAR") }
+        }
+        val before = Files.readAllBytes(input)
+        val legacy = Path.of(System.getenv("GOMANGA_VERIFICATION_H2_DRIVER"))
+        val failure = runCatching { EmbeddedDatabaseAdmission.prepare(ApplicationDirs(root.toString()), legacy) }.exceptionOrNull()
+        check(failure is IllegalStateException && failure.message == "Incompatible persisted sync flag definition") { failure.toString() }
+        check(Files.readAllBytes(input).contentEquals(before))
+    }
+
+    private fun verify(version: String) {
+        val source = Path.of(System.getenv("GOMANGA_VERIFICATION_FIXTURES"), version, "database.mv.db")
+        Files.copy(source, root.resolve("database.mv.db"))
+        val legacy = Path.of(System.getenv("GOMANGA_VERIFICATION_H2_DRIVER"))
+        repeat(2) {
+            EmbeddedDatabaseAdmission.prepare(ApplicationDirs(root.toString()), legacy)
+            DriverManager.getConnection("jdbc:h2:${root.resolve("database")};IFEXISTS=TRUE", "", "").use { db ->
+                db.createStatement().use { sql ->
+                    sql.executeQuery("SELECT LAST_PAGE_READ,BOOKMARK FROM CHAPTER WHERE ID=906").use { rows ->
+                        check(rows.next() && rows.getInt(1)==12 && rows.getBoolean(2))
+                    }
+                    sql.executeQuery("SELECT COUNT(*) FROM MIGRATIONS WHERE VERSION BETWEEN 1 AND 66").use { rows ->
+                        check(rows.next() && rows.getInt(1)==66)
+                    }
+                }
+            }
+        }
+    }
+}

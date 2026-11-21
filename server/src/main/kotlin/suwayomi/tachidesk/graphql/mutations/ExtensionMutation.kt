@@ -4,6 +4,7 @@ package suwayomi.tachidesk.graphql.mutations
 
 import eu.kanade.tachiyomi.source.local.LocalSource
 import io.javalin.http.UploadedFile
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.neq
@@ -12,6 +13,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import suwayomi.tachidesk.graphql.directives.RequireAuth
 import suwayomi.tachidesk.graphql.types.ExtensionStoreType
 import suwayomi.tachidesk.graphql.types.ExtensionType
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.manga.impl.extension.ExtensionsList
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
@@ -52,6 +54,7 @@ class ExtensionMutation {
         ids: List<String>,
         patch: UpdateExtensionPatch,
     ) {
+        ids.forEach(BuiltInKomgaLifecycle::rejectExtensionMutation)
         val extensions =
             transaction {
                 ExtensionTable
@@ -145,7 +148,10 @@ class ExtensionMutation {
                 transaction {
                     ExtensionTable
                         .selectAll()
-                        .where { ExtensionTable.name neq LocalSource.EXTENSION_NAME }
+                        .where {
+                            (ExtensionTable.name neq LocalSource.EXTENSION_NAME) and
+                                (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
+                        }
                         .map { ExtensionType(it) }
                 }
 

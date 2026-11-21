@@ -73,6 +73,12 @@ class SearchTest : ApplicationTest() {
     fun teardown() {
         unregisterSource(this.sourceId)
     }
+
+    @Test fun filterDefinitionCanonicalStructure() = FilterDefinitionContract.canonicalDefinition()
+    @Test fun filterSnapshotAndGuardUseOneList() = FilterDefinitionContract.snapshotAndDispatch()
+    @Test fun reorderedDefinitionNeverDispatches() = FilterDefinitionContract.mismatchNeverDispatches()
+    @Test fun invalidFilterStatesNeverDispatch() = FilterDefinitionContract.invalidStatesNeverDispatch()
+    @Test fun tokenlessFilterCallerRemainsCompatible() = FilterDefinitionContract.legacyDispatchIsPreserved()
 }
 
 @Suppress("UNCHECKED_CAST")

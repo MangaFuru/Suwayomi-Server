@@ -57,7 +57,10 @@ object MangaTable : IntIdTable() {
     val memo = jsonObject("memo")
 }
 
-fun MangaTable.toDataClass(mangaEntry: ResultRow) =
+fun MangaTable.toDataClass(
+    mangaEntry: ResultRow,
+    coverRequestHeaders: Map<String, String> = emptyMap(),
+) =
     MangaDataClass(
         id = mangaEntry[this.id].value,
         sourceId = mangaEntry[sourceReference].toString(),
@@ -80,7 +83,13 @@ fun MangaTable.toDataClass(mangaEntry: ResultRow) =
         lastModifiedAt = mangaEntry[lastModifiedAt],
         version = mangaEntry[version],
         memo = mangaEntry[memo],
-    )
+    ).apply {
+        // GoManga app-direct covers: source-direct absolute URL (stock thumbnailUrl
+        // stays the /thumbnail proxy = fallback) + the source's request headers.
+        // Set as BODY props (not ctor args) so MangaDataClass stays binary-compatible.
+        coverThumbnailUrl = mangaEntry[thumbnail_url]
+        coverHeaders = coverRequestHeaders
+    }
 
 enum class MangaStatus(
     val value: Int,

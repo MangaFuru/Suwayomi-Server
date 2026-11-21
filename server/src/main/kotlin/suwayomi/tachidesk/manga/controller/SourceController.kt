@@ -15,6 +15,8 @@ import suwayomi.tachidesk.manga.impl.Search.FilterChange
 import suwayomi.tachidesk.manga.impl.Search.FilterData
 import suwayomi.tachidesk.manga.impl.Source
 import suwayomi.tachidesk.manga.impl.Source.SourcePreferenceChange
+import suwayomi.tachidesk.manga.impl.Source.SourcePreferenceCaptureToken
+import suwayomi.tachidesk.manga.impl.Source.SourcePreferenceUpdateResult
 import suwayomi.tachidesk.manga.model.dataclass.PagedMangaListDataClass
 import suwayomi.tachidesk.manga.model.dataclass.SourceDataClass
 import suwayomi.tachidesk.server.JavalinSetup.Attribute
@@ -145,6 +147,53 @@ object SourceController {
             },
         )
 
+    val preferencePersistenceCapabilities =
+        handler(
+            pathParam<Long>("sourceId"),
+            documentWith = { withOperation { summary("Source preference persistence capability") } },
+            behaviorOf = { ctx, sourceId ->
+                ctx.future {
+                    future {
+                        ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                        ctx.json(Source.sourcePreferencePersistenceCapabilities(sourceId))
+                    }
+                }
+            },
+            withResults = { json<Source.SourcePreferencePersistenceCapabilities>(HttpStatus.OK) },
+        )
+
+    val registerPreferenceCapture =
+        handler(
+            pathParam<Long>("sourceId"),
+            documentWith = { body<SourcePreferenceCaptureToken>() },
+            behaviorOf = { ctx, sourceId ->
+                ctx.future {
+                    future {
+                        ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                        val token = ctx.bodyAsClass(SourcePreferenceCaptureToken::class.java).token
+                        ctx.json(mapOf("registered" to Source.registerSourcePreferenceCapture(sourceId, token)))
+                    }
+                }
+            },
+            withResults = { json<Map<String, Boolean>>(HttpStatus.OK) },
+        )
+
+    val acknowledgePreferenceCapture =
+        handler(
+            pathParam<Long>("sourceId"),
+            documentWith = { body<SourcePreferenceCaptureToken>() },
+            behaviorOf = { ctx, sourceId ->
+                ctx.future {
+                    future {
+                        ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                        val token = ctx.bodyAsClass(SourcePreferenceCaptureToken::class.java).token
+                        ctx.json(mapOf("acknowledged" to Source.acknowledgeSourcePreferenceCapture(sourceId, token)))
+                    }
+                }
+            },
+            withResults = { json<Map<String, Boolean>>(HttpStatus.OK) },
+        )
+
     /** set one preference of source with id `sourceId` */
     val setPreference =
         handler(
@@ -157,12 +206,23 @@ object SourceController {
                 body<SourcePreferenceChange>()
             },
             behaviorOf = { ctx, sourceId ->
-                ctx.getAttribute(Attribute.TachideskUser).requireUser()
-                val preferenceChange = ctx.bodyAsClass(SourcePreferenceChange::class.java)
-                ctx.json(Source.setSourcePreference(sourceId, preferenceChange.position, preferenceChange.value))
+                ctx.future {
+                    future {
+                        ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                        val preferenceChange = ctx.bodyAsClass(SourcePreferenceChange::class.java)
+                        val result = Source.setSourcePreference(sourceId, preferenceChange.position, preferenceChange.value)
+                        when (result.status) {
+                            "invalid" -> ctx.status(HttpStatus.BAD_REQUEST)
+                            "rejected" -> ctx.status(HttpStatus.UNPROCESSABLE_CONTENT)
+                        }
+                        ctx.json(result)
+                    }
+                }
             },
             withResults = {
-                httpCode(HttpStatus.OK)
+                json<SourcePreferenceUpdateResult>(HttpStatus.OK)
+                json<SourcePreferenceUpdateResult>(HttpStatus.BAD_REQUEST)
+                json<SourcePreferenceUpdateResult>(HttpStatus.UNPROCESSABLE_CONTENT)
             },
         )
 
@@ -181,7 +241,9 @@ object SourceController {
                 ctx.future {
                     future {
                         ctx.getAttribute(Attribute.TachideskUser).requireUser()
-                        ctx.json(Search.getFilterList(sourceId, reset))
+                        val snapshot = Search.getFilterSnapshot(sourceId, reset)
+                        ctx.header("X-Gomanga-Filter-Definition", snapshot.definitionToken)
+                        ctx.json(snapshot.items)
                     }
                 }
             },
@@ -265,7 +327,12 @@ object SourceController {
                 val filter = json.decodeFromString<FilterData>(ctx.body())
                 ctx.future {
                     future { Search.sourceFilter(sourceId, pageNum, filter) }
-                        .thenApply { ctx.json(it) }
+                        .thenApply { result -> ctx.json(result) }
+                        .exceptionally { error ->
+                            val cause = error.cause ?: error
+                            if (cause is Search.FilterDefinitionChanged) ctx.status(HttpStatus.CONFLICT).json(mapOf("code" to "FILTER_DEFINITION_CHANGED"))
+                            else throw java.util.concurrent.CompletionException(cause)
+                        }
                 }
             },
             withResults = {

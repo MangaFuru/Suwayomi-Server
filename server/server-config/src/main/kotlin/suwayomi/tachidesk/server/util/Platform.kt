@@ -20,7 +20,7 @@ object Platform {
         PlatformInfo(
             os = OS.from(System.getProperty("os.name")),
             arch = ARCH.from(System.getProperty("os.arch")),
-            headless = GraphicsEnvironment.isHeadless(),
+            headless = java.lang.Boolean.getBoolean("suwayomi.tachidesk.gomanga.slimMode") || GraphicsEnvironment.isHeadless(),
             jvm = getJvmInfo(),
         )
     }

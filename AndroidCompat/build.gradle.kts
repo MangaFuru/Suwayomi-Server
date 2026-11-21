@@ -43,9 +43,11 @@ dependencies {
     implementation(libs.bundles.settings)
 
     // Android version of SimpleDateFormat
-    implementation(libs.icu4j)
 
     // OpenJDK lacks native JPEG encoder and native WEBP decoder
     implementation(libs.bundles.twelvemonkeys)
     implementation(libs.imageio.webp)
 }
+
+// Source preference regression tests use the existing shared JUnit5 bundle.
+tasks.test { useJUnitPlatform() }

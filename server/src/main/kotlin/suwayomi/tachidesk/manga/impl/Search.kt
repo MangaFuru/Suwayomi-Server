@@ -13,6 +13,11 @@ import eu.kanade.tachiyomi.source.model.FilterList
 import io.javalin.json.JsonMapper
 import io.javalin.json.fromJsonString
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.booleanOrNull
 import suwayomi.tachidesk.manga.impl.MangaList.processEntries
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
 import suwayomi.tachidesk.manga.model.dataclass.PagedMangaListDataClass
@@ -35,7 +40,13 @@ object Search {
         filter: FilterData,
     ): PagedMangaListDataClass {
         val source = getSourceOrStub(sourceId)
-        val filterList = if (filter.filter != null) buildFilterList(sourceId, filter.filter) else source.getFilterList()
+        val filterList = source.getFilterList()
+        if (filter.expectedFilterDefinition != null) {
+            if (FilterDefinitionToken.forList(filterList) != filter.expectedFilterDefinition) throw FilterDefinitionChanged()
+            if (filter.filter != null) updateFilterListValidated(filterList, filter.filter)
+        } else if (filter.filter != null) {
+            updateFilterList(filterList, filter.filter)
+        }
         val searchManga = source.getSearchManga(pageNum, filter.searchTerm ?: "", filterList)
         return searchManga.processEntries(sourceId)
     }
@@ -55,10 +66,17 @@ object Search {
     suspend fun getFilterList(
         sourceId: Long,
         reset: Boolean,
-    ): List<FilterObject> {
-        val source = getSourceOrStub(sourceId)
+    ): List<FilterObject> = filterObjects(getFilterListOf(getSourceOrStub(sourceId), reset))
 
-        return getFilterListOf(source, reset).list.map {
+    data class FilterSnapshot(val items: List<FilterObject>, val definitionToken: String)
+
+    suspend fun getFilterSnapshot(sourceId: Long, reset: Boolean): FilterSnapshot {
+        val filters = getFilterListOf(getSourceOrStub(sourceId), reset)
+        return FilterSnapshot(filterObjects(filters), FilterDefinitionToken.forList(filters))
+    }
+
+    private fun filterObjects(filters: FilterList): List<FilterObject> {
+        return filters.list.map {
             FilterObject(
                 when (it) {
                     is Filter.Header -> "Header"
@@ -165,6 +183,39 @@ object Search {
         return filterList
     }
 
+    private fun updateFilterListValidated(filterList: FilterList, changes: List<FilterChange>) {
+        try {
+            changes.forEach { change ->
+                val target = filterList.getOrNull(change.position) ?: throw IllegalArgumentException()
+                when (target) {
+                    is Filter.Select<*> -> require(change.state.toInt() in target.values.indices)
+                    is Filter.CheckBox -> change.state.toBooleanStrict()
+                    is Filter.TriState -> require(change.state.toInt() in 0..2)
+                    is Filter.Group<*> -> {
+                        val objectValue = Json.parseToJsonElement(change.state) as? JsonObject ?: throw IllegalArgumentException()
+                        val position = objectValue["position"] as? JsonPrimitive ?: throw IllegalArgumentException()
+                        val state = objectValue["state"] as? JsonPrimitive ?: throw IllegalArgumentException()
+                        require(!position.isString && state.isString)
+                        val nested = FilterChange(position.intOrNull ?: throw IllegalArgumentException(), state.content)
+                        val child = target.state.getOrNull(nested.position) as? Filter<*> ?: throw IllegalArgumentException()
+                        when (child) { is Filter.Select<*> -> require(nested.state.toInt() in child.values.indices); is Filter.CheckBox -> nested.state.toBooleanStrict(); is Filter.TriState -> require(nested.state.toInt() in 0..2); is Filter.Text -> Unit; else -> throw IllegalArgumentException() }
+                    }
+                    is Filter.Sort -> {
+                        val objectValue = Json.parseToJsonElement(change.state) as? JsonObject ?: throw IllegalArgumentException()
+                        val index = objectValue["index"] as? JsonPrimitive ?: throw IllegalArgumentException()
+                        val ascending = objectValue["ascending"] as? JsonPrimitive ?: throw IllegalArgumentException()
+                        require(!index.isString && !ascending.isString && ascending.booleanOrNull != null)
+                        require((index.intOrNull ?: throw IllegalArgumentException()) in target.values.indices)
+                    }
+                    is Filter.Header, is Filter.Separator -> throw IllegalArgumentException()
+                    is Filter.Text -> Unit
+                    else -> throw IllegalArgumentException()
+                }
+            }
+        } catch (_: Exception) { throw FilterDefinitionChanged() }
+        updateFilterList(filterList, changes)
+    }
+
     suspend fun buildFilterList(
         sourceId: Long,
         changes: List<FilterChange>,
@@ -186,7 +237,10 @@ object Search {
     data class FilterData(
         val searchTerm: String?,
         val filter: List<FilterChange>?,
+        val expectedFilterDefinition: String? = null,
     )
+
+    class FilterDefinitionChanged : RuntimeException("FILTER_DEFINITION_CHANGED")
 
     @Suppress("UNUSED_PARAMETER")
     fun sourceGlobalSearch(searchTerm: String) {

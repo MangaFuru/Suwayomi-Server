@@ -13,6 +13,8 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.flow.StateFlow
 import libcore.net.MimeUtils
+import okhttp3.Headers
+import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
@@ -20,10 +22,13 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import suwayomi.tachidesk.graphql.types.DownloadConversion
+import suwayomi.tachidesk.manga.impl.chapter.getChapterDownloadReadyByIndex
 import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrNull
+import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
 import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
+import suwayomi.tachidesk.manga.model.dataclass.PageImageResourceDataClass
 import suwayomi.tachidesk.manga.model.table.ChapterTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
 import suwayomi.tachidesk.manga.model.table.PageTable
@@ -41,6 +46,59 @@ import javax.imageio.ImageWriter
 object Page {
     private val logger = KotlinLogging.logger {}
 
+    private fun pageProxyPath(
+        mangaId: Int,
+        chapterIndex: Int,
+        index: Int,
+    ): String = "/api/v1/manga/$mangaId/chapter/$chapterIndex/page/$index"
+
+    private fun pageCacheKey(
+        mangaId: Int,
+        chapterIndex: Int,
+        index: Int,
+        imageUrl: String?,
+        pageUrl: String,
+    ): String = "suwayomi-page:$mangaId:$chapterIndex:$index:${imageUrl ?: pageUrl}"
+
+    private fun Headers.toHeaderMap(): Map<String, String> = names().associateWith { name -> get(name).orEmpty() }
+
+    private fun pageRowsForChapter(chapterId: Int): List<ResultRow> =
+        transaction {
+            PageTable
+                .selectAll()
+                .where { PageTable.chapter eq chapterId }
+                .orderBy(PageTable.index to SortOrder.ASC)
+                .toList()
+        }
+
+    private suspend fun resolveHttpImageUrl(
+        pageEntry: ResultRow,
+        chapterId: Int,
+        source: HttpSource,
+    ): String? {
+        val cached = pageEntry[PageTable.imageUrl]
+        if (cached != null) return cached
+
+        val tachiyomiPage =
+            Page(
+                pageEntry[PageTable.index],
+                pageEntry[PageTable.url],
+                null,
+            )
+        val trueImageUrl =
+            try {
+                getTrueImageUrl(tachiyomiPage, source)
+            } catch (_: Exception) {
+                return null
+            }
+        transaction {
+            PageTable.update({ (PageTable.chapter eq chapterId) and (PageTable.index eq pageEntry[PageTable.index]) }) {
+                it[imageUrl] = trueImageUrl
+            }
+        }
+        return trueImageUrl
+    }
+
     /**
      * A page might have a imageUrl ready from the get go, or we might need to
      * go an extra step and call fetchImageUrl to get it.
@@ -53,6 +111,62 @@ object Page {
             page.imageUrl = source.getImageUrl(page)
         }
         return page.imageUrl!!
+    }
+
+    suspend fun getPageImageResources(
+        mangaId: Int,
+        chapterIndex: Int,
+    ): List<PageImageResourceDataClass> {
+        val mangaEntry = transaction { MangaTable.selectAll().where { MangaTable.id eq mangaId }.first() }
+        val source = getSourceOrStub(mangaEntry[MangaTable.sourceReference])
+        var chapterEntry =
+            transaction {
+                ChapterTable
+                    .selectAll()
+                    .where { (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId) }
+                    .first()
+            }
+        val chapterId = chapterEntry[ChapterTable.id].value
+
+        var pageRows = pageRowsForChapter(chapterId)
+        if (pageRows.isEmpty() || chapterEntry[ChapterTable.pageCount] <= 0) {
+            getChapterDownloadReadyByIndex(chapterIndex, mangaId)
+            chapterEntry =
+                transaction {
+                    ChapterTable
+                        .selectAll()
+                        .where { (ChapterTable.sourceOrder eq chapterIndex) and (ChapterTable.manga eq mangaId) }
+                        .first()
+                }
+            pageRows = pageRowsForChapter(chapterEntry[ChapterTable.id].value)
+        }
+
+        if (source !is HttpSource) {
+            return pageRows.map { pageEntry ->
+                val index = pageEntry[PageTable.index]
+                PageImageResourceDataClass(
+                    index = index,
+                    imageUrl = null,
+                    cacheKey = pageCacheKey(mangaId, chapterIndex, index, null, pageEntry[PageTable.url]),
+                    fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
+                    requiresProxy = true,
+                )
+            }
+        }
+
+        val headers = source.headers.toHeaderMap()
+        return pageRows.map { pageEntry ->
+            val index = pageEntry[PageTable.index]
+            val imageUrl = resolveHttpImageUrl(pageEntry, chapterEntry[ChapterTable.id].value, source)
+            PageImageResourceDataClass(
+                index = index,
+                imageUrl = imageUrl,
+                headers = headers,
+                cacheKey = pageCacheKey(mangaId, chapterIndex, index, imageUrl, pageEntry[PageTable.url]),
+                fallbackImageUrl = pageProxyPath(mangaId, chapterIndex, index),
+                requiresProxy = imageUrl == null,
+            )
+        }
     }
 
     suspend fun getPageImage(

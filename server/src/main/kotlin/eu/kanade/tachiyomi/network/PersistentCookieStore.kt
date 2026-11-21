@@ -15,9 +15,14 @@ import kotlin.time.Duration.Companion.seconds
 // from TachiWeb-Server
 class PersistentCookieStore(
     context: Context,
+    namespace: String = "legacy",
 ) : CookieStore {
     private val cookieMap = mutableMapOf<String, List<Cookie>>()
-    private val prefs = context.getSharedPreferences("cookie_store", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(
+        if (namespace == "legacy") "cookie_store"
+        else "cookie_store_" + namespace.replace(Regex("[^A-Za-z0-9_-]"), "_"),
+        Context.MODE_PRIVATE,
+    )
 
     private val lock = ReentrantLock()
 
@@ -74,6 +79,91 @@ class PersistentCookieStore(
             }
 
             saveToDisk(domainsToSave.toSet())
+        }
+    }
+
+    fun removeHost(host: String): Boolean =
+        lock.withLock {
+            val normalizedHost = normalizeHost(host)
+            if (normalizedHost.isBlank()) return@withLock false
+            val domainsToRemove = cookieMap.keys.filter { cookieDomainOverlaps(it, normalizedHost) }.toSet()
+            if (domainsToRemove.isEmpty()) return@withLock false
+            domainsToRemove.forEach { cookieMap.remove(it) }
+            saveToDisk(domainsToRemove)
+            true
+        }
+
+    fun removeNamedForHost(
+        host: String,
+        names: Set<String>,
+    ): Boolean =
+        lock.withLock {
+            val normalizedHost = normalizeHost(host)
+            val lowerNames = names.map { it.lowercase() }.toSet()
+            if (normalizedHost.isBlank() || lowerNames.isEmpty()) return@withLock false
+            val domainsToSave = mutableSetOf<String>()
+            cookieMap.keys
+                .filter { cookieDomainOverlaps(it, normalizedHost) }
+                .toList()
+                .forEach { domain ->
+                    val current = cookieMap[domain].orEmpty()
+                    val kept = current.filter { it.name.lowercase() !in lowerNames }
+                    if (kept.size != current.size) {
+                        domainsToSave.add(domain)
+                        if (kept.isEmpty()) {
+                            cookieMap.remove(domain)
+                        } else {
+                            cookieMap[domain] = kept
+                        }
+                    }
+                }
+            if (domainsToSave.isEmpty()) return@withLock false
+            saveToDisk(domainsToSave)
+            true
+        }
+
+    fun replaceNamedForHost(
+        host: String,
+        names: Set<String>,
+        cookies: List<Cookie>,
+    ) {
+        lock.withLock {
+            val normalizedHost = normalizeHost(host)
+            val lowerNames = names.map { it.lowercase() }.toSet()
+            val domainsToSave = mutableSetOf<String>()
+            if (normalizedHost.isNotBlank() && lowerNames.isNotEmpty()) {
+                cookieMap.keys
+                    .filter { cookieDomainOverlaps(it, normalizedHost) }
+                    .toList()
+                    .forEach { domain ->
+                        val current = cookieMap[domain].orEmpty()
+                        val kept = current.filter { it.name.lowercase() !in lowerNames }
+                        if (kept.size != current.size) {
+                            domainsToSave.add(domain)
+                            if (kept.isEmpty()) {
+                                cookieMap.remove(domain)
+                            } else {
+                                cookieMap[domain] = kept
+                            }
+                        }
+                    }
+            }
+
+            for (cookie in cookies) {
+                val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
+                val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name }
+                if (pos == -1) {
+                    cookiesForDomain.add(cookie)
+                } else {
+                    cookiesForDomain[pos] = cookie
+                }
+                cookieMap[cookie.domain] = cookiesForDomain
+                domainsToSave.add(cookie.domain)
+            }
+
+            if (domainsToSave.isNotEmpty()) {
+                saveToDisk(domainsToSave)
+            }
         }
     }
 
@@ -192,6 +282,20 @@ class PersistentCookieStore(
                     }
                 }
             }.apply()
+    }
+
+    private fun normalizeHost(host: String): String =
+        host.trim().lowercase().removePrefix(".").removeSuffix(".")
+
+    private fun cookieDomainOverlaps(
+        domain: String,
+        host: String,
+    ): Boolean {
+        val normalizedDomain = normalizeHost(domain)
+        return normalizedDomain.isNotBlank() &&
+            (normalizedDomain == host ||
+                normalizedDomain.endsWith(".$host") ||
+                host.endsWith(".$normalizedDomain"))
     }
 
     private fun Cookie.hasExpired() = System.currentTimeMillis() >= expiresAt

@@ -67,6 +67,8 @@ dependencies {
     implementation(libs.okhttp.core)
     implementation(libs.rxjava)
     implementation(libs.jsoup)
+    // GoManga built-in Komga provider: chapter-title templates.
+    implementation("org.apache.commons:commons-text:1.11.0")
 
     // ComicInfo
     implementation(libs.serialization.xml.core)

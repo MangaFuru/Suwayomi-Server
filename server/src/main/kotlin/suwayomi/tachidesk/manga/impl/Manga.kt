@@ -127,12 +127,17 @@ object Manga {
                     }
             }
 
-        return source.getMangaUpdate(
-            sManga,
-            sChapters,
-            fetchDetails = fetchDetails,
-            fetchChapters = fetchChapters,
-        )
+        return MangaUpdateGate.withPermit(
+            sourceId = mangaEntry[MangaTable.sourceReference].toString(),
+            mangaUrl = mangaEntry[MangaTable.url],
+        ) {
+            source.getMangaUpdate(
+                sManga,
+                sChapters,
+                fetchDetails = fetchDetails,
+                fetchChapters = fetchChapters,
+            )
+        }
     }
 
     suspend fun fetchManga(mangaId: Int): SManga? {

@@ -29,7 +29,11 @@ abstract class HttpSource : CatalogueSource {
     /**
      * Network service.
      */
-    protected val network: NetworkHelper by injectLazy()
+    private val rootNetwork: NetworkHelper by injectLazy()
+
+    /** Source-bound view; keep the inherited ABI so custom extensions that use
+     * network.client or network.cloudflareClient receive source isolation too. */
+    protected val network: NetworkHelper by lazy { rootNetwork.forSource { id.toString() } }
 
     /**
      * Base url of the website without the trailing slash, like: http://mysite.com
@@ -68,9 +72,36 @@ abstract class HttpSource : CatalogueSource {
     override val id: Long by lazy { generateId(name, lang, versionId) }
 
     /**
-     * Headers used for requests.
+     * Headers used for requests. Keep explicitly selected source headers stable,
+     * while rebuilding only the default-header snapshot when the host baseline
+     * UA changes; the source/client instance itself does not need reconstruction.
      */
-    val headers: Headers by lazy { headersBuilder().build() }
+    private data class HeaderSnapshot(val headers: Headers, val defaultUserAgent: String)
+
+    // Keep the Kotlin Lazy field ABI: existing extensions replace headers$delegate
+    // reflectively. The getter must still read that delegate, including replacements.
+    val headers: Headers by liveHeadersDelegate()
+
+    private fun liveHeadersDelegate(): Lazy<Headers> = object : Lazy<Headers> {
+        @Volatile private var snapshot: HeaderSnapshot? = null
+
+        override val value: Headers
+            get() = synchronized(this) {
+                val baseline = network.defaultUserAgentProvider()
+                val current = snapshot
+                if (current != null && current.defaultUserAgent == baseline) {
+                    current.headers
+                } else {
+                    // Let the source builder select its explicit headers again;
+                    // never infer ownership by comparing UA strings.
+                    headersBuilder().build().also {
+                        snapshot = HeaderSnapshot(it, baseline)
+                    }
+                }
+            }
+
+        override fun isInitialized(): Boolean = snapshot != null
+    }
 
     /**
      * Default network client for doing requests.

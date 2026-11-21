@@ -41,6 +41,7 @@ import kotlin.io.path.outputStream
 class JavaSharedPreferences(
     private val key: String,
 ) : SharedPreferences {
+    // GOMANGA_SOURCE_PREFERENCE_MEMORY_ONLY_V1
     companion object {
         private val logger = KotlinLogging.logger {}
     }
@@ -57,6 +58,11 @@ class JavaSharedPreferences(
 
         data object Clear : Action()
     }
+
+    private val memoryOnly = SourcePreferencePersistenceCapability.memoryOnly(key)
+    private var mutationGeneration = 0L
+    private var capture: Capture? = null
+    private data class Capture(val token: String, val generation: Long, val fileDigest: String?, val valuesDigest: String)
 
     private val file =
         Path(
@@ -75,6 +81,38 @@ class JavaSharedPreferences(
             }
         }
     private val preferences = PropertiesSettings(properties)
+
+    fun isMemoryOnly(): Boolean = memoryOnly
+
+    fun hasLegacySourcePreferences(): Boolean = memoryOnly && file.exists()
+
+    fun registerCanonicalCapture(token: String): Boolean =
+        synchronized(properties) {
+            if (!memoryOnly || token.isEmpty()) return@synchronized false
+            capture =
+                Capture(
+                    token,
+                    mutationGeneration,
+                    SourcePreferencePersistenceCapability.fileFingerprint(file),
+                    SourcePreferencePersistenceCapability.propertiesFingerprint(properties),
+                )
+            true
+        }
+
+    fun acknowledgeCanonicalCapture(token: String, committed: Boolean): Boolean =
+        synchronized(properties) {
+            val expected = capture ?: return@synchronized false
+            if (!memoryOnly || !committed || token != expected.token ||
+                mutationGeneration != expected.generation ||
+                SourcePreferencePersistenceCapability.fileFingerprint(file) != expected.fileDigest ||
+                SourcePreferencePersistenceCapability.propertiesFingerprint(properties) != expected.valuesDigest
+            ) {
+                return@synchronized false
+            }
+            file.deleteIfExists()
+            capture = null
+            true
+        }
 
     private val listeners = mutableMapOf<SharedPreferences.OnSharedPreferenceChangeListener, (String) -> Unit>()
 
@@ -136,6 +174,7 @@ class JavaSharedPreferences(
 
     private fun saveActions(actions: List<Action>) =
         synchronized(properties) {
+            if (memoryOnly && actions.isNotEmpty()) mutationGeneration += 1
             actions.forEach {
                 @Suppress("UNCHECKED_CAST")
                 when (it) {
@@ -214,6 +253,10 @@ class JavaSharedPreferences(
         }
 
     private fun save(actions: List<Action>): Boolean {
+        if (memoryOnly) {
+            saveActions(actions)
+            return true
+        }
         val snapshot =
             synchronized(properties) {
                 saveActions(actions)
@@ -254,9 +297,10 @@ class JavaSharedPreferences(
     private fun saveAsync(actions: List<Action>) {
         saveActions(actions)
 
-        dirty.store(true)
-
-        startAsyncSaver()
+        if (!memoryOnly) {
+            dirty.store(true)
+            startAsyncSaver()
+        }
     }
 
     override fun edit(): SharedPreferences.Editor = Editor(::save, ::saveAsync)

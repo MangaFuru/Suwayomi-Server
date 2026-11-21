@@ -21,6 +21,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.impl.extension.Extension.proxyExtensionIconUrl
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionDataClass
@@ -41,7 +42,9 @@ object ExtensionsList {
         ExtensionStoreService.getAndRefresh().forEach { store ->
             try {
                 val extensions = ExtensionStoreService.getExtensions(store)
-                allExtensions.addAll(extensions)
+                allExtensions.addAll(
+                    extensions.filterNot { BuiltInKomgaLifecycle.isBuiltInPackage(it.pkgName) },
+                )
             } catch (e: Exception) {
                 logger.warn(e) {
                     "Failed to fetch extensions for store: ${store.indexUrl}"
@@ -71,22 +74,27 @@ object ExtensionsList {
 
     fun extensionTableAsDataClass() =
         transaction {
-            ExtensionTable.selectAll().filter { it[ExtensionTable.name] != LocalSource.EXTENSION_NAME }.map {
-                ExtensionDataClass(
-                    repo = it[ExtensionTable.storeIndexUrl],
-                    apkName = it[ExtensionTable.apkName].orEmpty(),
-                    iconUrl = proxyExtensionIconUrl(it[ExtensionTable.pkgName]),
-                    name = it[ExtensionTable.name],
-                    pkgName = it[ExtensionTable.pkgName],
-                    versionName = it[ExtensionTable.versionName],
-                    versionCode = it[ExtensionTable.versionCode].toInt(),
-                    lang = it[ExtensionTable.lang],
-                    isNsfw = it[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
-                    installed = it[ExtensionTable.isInstalled],
-                    hasUpdate = it[ExtensionTable.hasUpdate],
-                    obsolete = it[ExtensionTable.isObsolete],
-                )
-            }
+            ExtensionTable
+                .selectAll()
+                .filter {
+                    it[ExtensionTable.name] != LocalSource.EXTENSION_NAME &&
+                        !BuiltInKomgaLifecycle.isBuiltInPackage(it[ExtensionTable.pkgName])
+                }.map {
+                    ExtensionDataClass(
+                        repo = it[ExtensionTable.storeIndexUrl],
+                        apkName = it[ExtensionTable.apkName].orEmpty(),
+                        iconUrl = proxyExtensionIconUrl(it[ExtensionTable.pkgName]),
+                        name = it[ExtensionTable.name],
+                        pkgName = it[ExtensionTable.pkgName],
+                        versionName = it[ExtensionTable.versionName],
+                        versionCode = it[ExtensionTable.versionCode].toInt(),
+                        lang = it[ExtensionTable.lang],
+                        isNsfw = it[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
+                        installed = it[ExtensionTable.isInstalled],
+                        hasUpdate = it[ExtensionTable.hasUpdate],
+                        obsolete = it[ExtensionTable.isObsolete],
+                    )
+                }
         }
 
     private val updateExtensionDatabaseMutex = Mutex()
@@ -96,6 +104,7 @@ object ExtensionsList {
             transaction {
                 val uniqueExtensions =
                     foundExtensions
+                        .filterNot { BuiltInKomgaLifecycle.isBuiltInPackage(it.pkgName) }
                         .groupBy { it.pkgName }
                         .mapValues { (_, extension) ->
                             extension.maxBy { it.versionCode }

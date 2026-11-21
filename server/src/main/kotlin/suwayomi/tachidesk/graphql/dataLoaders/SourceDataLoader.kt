@@ -12,12 +12,15 @@ import graphql.GraphQLContext
 import org.dataloader.DataLoader
 import org.dataloader.DataLoaderFactory
 import org.jetbrains.exposed.v1.core.Slf4jSqlDebugLogger
+import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.neq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.suspendTransaction
 import suwayomi.tachidesk.graphql.types.SourceNodeList
 import suwayomi.tachidesk.graphql.types.SourceNodeList.Companion.toNodeList
 import suwayomi.tachidesk.graphql.types.SourceType
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.JavalinSetup.future
@@ -55,7 +58,10 @@ class SourcesForExtensionDataLoader : KotlinDataLoader<String, SourceNodeList> {
                         SourceTable
                             .innerJoin(ExtensionTable)
                             .selectAll()
-                            .where { ExtensionTable.pkgName inList ids }
+                            .where {
+                                (ExtensionTable.pkgName inList ids) and
+                                    (ExtensionTable.pkgName neq BuiltInKomgaLifecycle.packageId)
+                            }
                             .map { Pair(it[ExtensionTable.pkgName], SourceType(it)) }
                             .groupBy { it.first }
                             .mapValues { it.value.mapNotNull { pair -> pair.second } }

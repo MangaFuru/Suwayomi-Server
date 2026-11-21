@@ -173,6 +173,26 @@ public class CustomContext extends Context {
         return preferences;
     }
 
+    public boolean registerSourcePreferenceCanonicalCapture(String name, String token) {
+        if (!name.startsWith("source_") || token == null || token.isEmpty()) return false;
+        SharedPreferences preferences;
+        synchronized (this) {
+            preferences = prefs.get(name);
+        }
+        return preferences instanceof JavaSharedPreferences
+                && ((JavaSharedPreferences) preferences).registerCanonicalCapture(token);
+    }
+
+    public boolean acknowledgeSourcePreferenceCanonicalCapture(String name, String token, boolean committed) {
+        if (!name.startsWith("source_") || token == null || token.isEmpty()) return false;
+        SharedPreferences preferences;
+        synchronized (this) {
+            preferences = prefs.get(name);
+        }
+        return preferences instanceof JavaSharedPreferences
+                && ((JavaSharedPreferences) preferences).acknowledgeCanonicalCapture(token, committed);
+    }
+
     @Override
     public SharedPreferences getSharedPreferences(@NotNull File file, int mode) {
         String path = file.getAbsolutePath().replace('\\', '/');

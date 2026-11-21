@@ -37,12 +37,14 @@ import suwayomi.tachidesk.global.impl.sync.SyncManager
 import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.i18n.LocalizationHelper
 import suwayomi.tachidesk.manga.impl.backup.proto.ProtoBackupExport
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.impl.download.DownloadManager
 import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
 import suwayomi.tachidesk.manga.impl.update.IUpdater
 import suwayomi.tachidesk.manga.impl.update.Updater
 import suwayomi.tachidesk.manga.impl.util.lang.renameTo
+import suwayomi.tachidesk.server.database.DBManager
 import suwayomi.tachidesk.server.database.databaseUp
 import suwayomi.tachidesk.server.generated.BuildConfig
 import suwayomi.tachidesk.server.settings.SettingsRegistry
@@ -70,8 +72,18 @@ import java.net.Authenticator
 import java.net.PasswordAuthentication
 import java.security.Security
 import java.util.Locale
+import kotlin.concurrent.thread
 
 private val logger = KotlinLogging.logger {}
+
+private fun initializeBuiltInKomga() {
+    try {
+        BuiltInKomgaLifecycle.initialize()
+    } catch (error: Throwable) {
+        logger.error(error) { "Failed to initialize the built-in Komga provider" }
+        shutdownApp(ExitCode.BuiltInKomgaSetupFailure)
+    }
+}
 
 class ApplicationDirs(
     val dataRoot: String = ApplicationRootDir,
@@ -166,31 +178,44 @@ fun applicationSetup() {
 
     // Application dirs
     val applicationDirs = ApplicationDirs()
+    // ── GoManga slim-mode ──
+    // The iOS GoManga app uses Suwayomi only as an extension parser host.
+    // The flag is read early so startup-only desktop/server guards can be
+    // skipped before they spend time on file loggers, loopback probes, or
+    // migration scans.
+    val slimMode = System.getProperty("suwayomi.tachidesk.gomanga.slimMode", "false") == "true"
 
-    initLoggerConfig(
-        applicationDirs.dataRoot,
-        serverConfig.maxLogFiles.value,
-        serverConfig.maxLogFileSize.value,
-        serverConfig.maxLogFolderSize.value,
-    )
+    if (!slimMode) {
+        initLoggerConfig(
+            applicationDirs.dataRoot,
+            serverConfig.maxLogFiles.value,
+            serverConfig.maxLogFileSize.value,
+            serverConfig.maxLogFolderSize.value,
+        )
 
-    serverConfig.subscribeTo(
-        combine(
-            serverConfig.maxLogFiles,
-            serverConfig.maxLogFileSize,
-            serverConfig.maxLogFolderSize,
-        ) { maxLogFiles, maxLogFileSize, maxLogFolderSize ->
-            Triple(maxLogFiles, maxLogFileSize, maxLogFolderSize)
-        }.distinctUntilChanged(),
-        { (maxLogFiles, maxLogFileSize, maxLogFolderSize) ->
-            logger.debug {
-                "updateFileAppender: maxLogFiles= $maxLogFiles, maxLogFileSize= $maxLogFileSize, maxLogFolderSize= $maxLogFolderSize"
-            }
-            updateFileAppender(maxLogFiles, maxLogFileSize, maxLogFolderSize)
-        },
-    )
+        serverConfig.subscribeTo(
+            combine(
+                serverConfig.maxLogFiles,
+                serverConfig.maxLogFileSize,
+                serverConfig.maxLogFolderSize,
+            ) { maxLogFiles, maxLogFileSize, maxLogFolderSize ->
+                Triple(maxLogFiles, maxLogFileSize, maxLogFolderSize)
+            }.distinctUntilChanged(),
+            { (maxLogFiles, maxLogFileSize, maxLogFolderSize) ->
+                logger.debug {
+                    "updateFileAppender: maxLogFiles= $maxLogFiles, maxLogFileSize= $maxLogFileSize, maxLogFolderSize= $maxLogFolderSize"
+                }
+                updateFileAppender(maxLogFiles, maxLogFileSize, maxLogFolderSize)
+            },
+        )
 
-    setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
+        setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
+    } else {
+        setLogLevelFor(BASE_LOGGER_NAME, Level.WARN)
+        setLogLevelFor("Exposed", Level.ERROR)
+        setLogLevelFor("graphql", Level.WARN)
+        setLogLevelFor("notprivacysafe", Level.WARN)
+    }
 
     logger.info { "Running Suwayomi-Server ${BuildConfig.VERSION}" }
 
@@ -209,20 +234,32 @@ fun applicationSetup() {
 
     logger.debug { "Data Root directory is set to: ${applicationDirs.dataRoot}" }
 
-    // Migrate Directories from old versions
-    File("$ApplicationRootDir/manga-thumbnails").renameTo(applicationDirs.tempThumbnailCacheRoot)
-    File("$ApplicationRootDir/manga-local").renameTo(applicationDirs.localMangaRoot)
-    File("$ApplicationRootDir/anime-thumbnails").delete()
+    if (slimMode) {
+        thread(start = true, isDaemon = true, name = "gomanga-bouncycastle-init") {
+            Thread.sleep(2_000)
+            Security.addProvider(BouncyCastleProvider())
+            logger.info { "GoManga slim-mode: BouncyCastle provider registered in background" }
+        }
+    }
 
-    // make dirs we need
-    listOf(
-        applicationDirs.dataRoot,
-        applicationDirs.extensionsRoot,
-        applicationDirs.extensionsRoot + "/icon",
-        applicationDirs.tempThumbnailCacheRoot,
-        applicationDirs.downloadsRoot,
-        applicationDirs.localMangaRoot,
-    ).forEach { File(it).mkdirs() }
+    if (!slimMode) {
+        // Migrate Directories from old versions
+        File("$ApplicationRootDir/manga-thumbnails").renameTo(applicationDirs.tempThumbnailCacheRoot)
+        File("$ApplicationRootDir/manga-local").renameTo(applicationDirs.localMangaRoot)
+        File("$ApplicationRootDir/anime-thumbnails").delete()
+
+        // make dirs we need
+        listOf(
+            applicationDirs.dataRoot,
+            applicationDirs.extensionsRoot,
+            applicationDirs.extensionsRoot + "/icon",
+            applicationDirs.tempThumbnailCacheRoot,
+            applicationDirs.downloadsRoot,
+            applicationDirs.localMangaRoot,
+        ).forEach { File(it).mkdirs() }
+    } else {
+        logger.info { "GoManga slim-mode: skipping startup directory migration/materialization" }
+    }
 
     // initialize Koin modules
     val app = App()
@@ -263,7 +300,11 @@ fun applicationSetup() {
     }
 
     // Make sure only one instance of the app is running
-    handleAppMutex()
+    if (!slimMode) {
+        handleAppMutex()
+    } else {
+        logger.info { "GoManga slim-mode: skipping AppMutex self-probe" }
+    }
 
     // Load Android compatibility dependencies
     AndroidCompatInitializer().init()
@@ -280,42 +321,49 @@ fun applicationSetup() {
         .onEach { System.setProperty("http.agent", it) }
         .launchIn(GlobalScope)
 
-    // create or update conf file if doesn't exist
-    try {
-        val dataConfFile = File("${applicationDirs.dataRoot}/server.conf")
-        if (!dataConfFile.exists()) {
-            JavalinSetup::class.java.getResourceAsStream("/server-reference.conf").use { input ->
-                dataConfFile.outputStream().use { output -> input.copyTo(output) }
-            }
-        } else {
-            // make sure the user config file is up-to-date
-            GlobalConfigManager.updateUserConfig {
-                try {
-                    migrateConfig(this, it)
-                } catch (e: Throwable) {
-                    logger.error(e) { "Failed to migrate config" }
-                    shutdownApp(ExitCode.ConfigMigrationFailure)
+    if (!slimMode) {
+        // create or update conf file if doesn't exist
+        try {
+            val dataConfFile = File("${applicationDirs.dataRoot}/server.conf")
+            if (!dataConfFile.exists()) {
+                JavalinSetup::class.java.getResourceAsStream("/server-reference.conf").use { input ->
+                    dataConfFile.outputStream().use { output -> input.copyTo(output) }
                 }
-
-                this
+            } else {
+                // make sure the user config file is up-to-date
+                GlobalConfigManager.updateUserConfig {
+                    try {
+                        migrateConfig(this, it)
+                    } catch (e: Throwable) {
+                        logger.error(e) { "Failed to migrate config" }
+                        shutdownApp(ExitCode.ConfigMigrationFailure)
+                    }
+                    this
+                }
             }
+        } catch (e: Exception) {
+            logger.error(e) { "Exception while creating initial server.conf" }
+            shutdownApp(ExitCode.SetupConfFileFailed)
         }
-    } catch (e: Exception) {
-        logger.error(e) { "Exception while creating initial server.conf" }
-        shutdownApp(ExitCode.SetupConfFileFailed)
+    } else {
+        logger.info { "GoManga slim-mode: skipping server.conf materialization" }
     }
 
-    // copy local source icon
-    try {
-        val localSourceIconFile = File("${applicationDirs.extensionsRoot}/icon/localSource.png")
-        if (!localSourceIconFile.exists()) {
-            JavalinSetup::class.java.getResourceAsStream("/icon/localSource.png").use { input ->
-                localSourceIconFile.outputStream().use { output -> input.copyTo(output) }
+    if (!slimMode) {
+        // copy local source icon
+        try {
+            val localSourceIconFile = File("${applicationDirs.extensionsRoot}/icon/localSource.png")
+            if (!localSourceIconFile.exists()) {
+                JavalinSetup::class.java.getResourceAsStream("/icon/localSource.png").use { input ->
+                    localSourceIconFile.outputStream().use { output -> input.copyTo(output) }
+                }
             }
+        } catch (e: Exception) {
+            logger.error(e) { "Exception while copying Local source's icon" }
+            shutdownApp(ExitCode.LocalSourceIconCopyFailure)
         }
-    } catch (e: Exception) {
-        logger.error(e) { "Exception while copying Local source's icon" }
-        shutdownApp(ExitCode.LocalSourceIconCopyFailure)
+    } else {
+        logger.info { "GoManga slim-mode: skipping local source icon materialization" }
     }
 
     // fixes #119 , ref:
@@ -323,15 +371,25 @@ fun applicationSetup() {
     // calculation depends on String.lowercase()
     Locale.setDefault(Locale.ENGLISH)
 
-    // Initialize the localization service
-    LocalizationHelper.initialize()
-    logger.debug {
-        "Localization service initialized. Supported languages: ${LocalizationHelper.getSupportedLocales()}"
+    if (!slimMode) {
+        // Initialize the localization service
+        LocalizationHelper.initialize()
+        logger.debug {
+            "Localization service initialized. Supported languages: ${LocalizationHelper.getSupportedLocales()}"
+        }
+    } else {
+        logger.info { "GoManga slim-mode: skipping localization service initialization" }
     }
 
-    runBlocking {
-        runMigrations(applicationDirs) {
-            databaseUp()
+    if (slimMode) {
+        logger.info { "GoManga slim-mode: preparing the embedded database" }
+        suwayomi.tachidesk.server.database.EmbeddedDatabaseAdmission.prepare(applicationDirs)
+        DBManager.setupDatabase()
+    } else {
+        runBlocking {
+            runMigrations(applicationDirs) {
+                databaseUp()
+            }
         }
     }
 
@@ -341,134 +399,165 @@ fun applicationSetup() {
         logger.error(e) { "Failed to setup LocalSource" }
         shutdownApp(ExitCode.LocalSourceSetupFailure)
     }
+    initializeBuiltInKomga()
 
-    serverConfig.subscribeTo(
-        combine<Any, DatabaseSettings>(
-            serverConfig.databaseType,
-            serverConfig.databaseUrl,
-            serverConfig.databaseUsername,
-            serverConfig.databasePassword,
-            serverConfig.useHikariConnectionPool,
-        ) { vargs ->
-            DatabaseSettings(
-                vargs[0] as DatabaseType,
-                vargs[1] as String,
-                vargs[2] as String,
-                vargs[3] as String,
-                vargs[4] as Boolean,
-            )
-        }.distinctUntilChanged(),
-        { (databaseType, databaseUrl, _databaseUsername, _databasePassword, hikariCp) ->
-            logger.info {
-                "Database changed - type=$databaseType url=$databaseUrl, username=[REDACTED], password=[REDACTED], hikaricp=$hikariCp"
-            }
-            databaseUp()
-
-            LocalSource.register()
-        },
-        ignoreInitialValue = true,
-    )
-
-    // create system tray
-    Updates.ENABLE = false
-    serverConfig.subscribeTo(
-        serverConfig.systemTrayEnabled,
-        { systemTrayEnabled ->
-            try {
-                if (systemTrayEnabled) {
-                    SystemTray.create()
-                } else {
-                    SystemTray.remove()
+    if (!slimMode) {
+        serverConfig.subscribeTo(
+            combine<Any, DatabaseSettings>(
+                serverConfig.databaseType,
+                serverConfig.databaseUrl,
+                serverConfig.databaseUsername,
+                serverConfig.databasePassword,
+                serverConfig.useHikariConnectionPool,
+            ) { vargs ->
+                DatabaseSettings(
+                    vargs[0] as DatabaseType,
+                    vargs[1] as String,
+                    vargs[2] as String,
+                    vargs[3] as String,
+                    vargs[4] as Boolean,
+                )
+            }.distinctUntilChanged(),
+            { (databaseType, databaseUrl, _databaseUsername, _databasePassword, hikariCp) ->
+                logger.info {
+                    "Database changed - type=$databaseType url=$databaseUrl, username=[REDACTED], password=[REDACTED], hikaricp=$hikariCp"
                 }
-            } catch (e: Throwable) {
-                // cover both java.lang.Exception and java.lang.Error
-                logger.error(e) { "Failed to create/remove SystemTray due to" }
-            }
-        },
-        ignoreInitialValue = false,
-    )
+                databaseUp()
+
+                LocalSource.register()
+                initializeBuiltInKomga()
+            },
+            ignoreInitialValue = true,
+        )
+
+        Updates.ENABLE = false
+        // create system tray
+        serverConfig.subscribeTo(
+            serverConfig.systemTrayEnabled,
+            { systemTrayEnabled ->
+                try {
+                    if (systemTrayEnabled) {
+                        SystemTray.create()
+                    } else {
+                        SystemTray.remove()
+                    }
+                } catch (e: Throwable) {
+                    // cover both java.lang.Exception and java.lang.Error
+                    logger.error(e) { "Failed to create/remove SystemTray due to" }
+                }
+            },
+            ignoreInitialValue = false,
+        )
+    }
 
     setLogLevelFor("org.eclipse.jetty", Level.OFF)
     setLogLevelFor("com.zaxxer.hikari", Level.WARN)
 
-    // socks proxy settings
-    serverConfig.subscribeTo(
-        combine<Any, ProxySettings>(
-            serverConfig.socksProxyEnabled,
-            serverConfig.socksProxyVersion,
-            serverConfig.socksProxyHost,
-            serverConfig.socksProxyPort,
-            serverConfig.socksProxyUsername,
-            serverConfig.socksProxyPassword,
-        ) { vargs ->
-            ProxySettings(
-                vargs[0] as Boolean,
-                vargs[1] as Int,
-                vargs[2] as String,
-                vargs[3] as String,
-                vargs[4] as String,
-                vargs[5] as String,
-            )
-        }.distinctUntilChanged(),
-        { (proxyEnabled, proxyVersion, proxyHost, proxyPort, proxyUsername, proxyPassword) ->
-            logger.info {
-                "Socks Proxy changed - enabled=$proxyEnabled address=$proxyHost:$proxyPort , username=[REDACTED], password=[REDACTED]"
-            }
-            if (proxyEnabled) {
-                System.setProperty("socksProxyHost", proxyHost)
-                System.setProperty("socksProxyPort", proxyPort)
-                System.setProperty("socksProxyVersion", proxyVersion.toString())
-
-                Authenticator.setDefault(
-                    object : Authenticator() {
-                        override fun getPasswordAuthentication(): PasswordAuthentication? {
-                            if (requestingProtocol.startsWith("SOCKS", ignoreCase = true)) {
-                                return PasswordAuthentication(
-                                    proxyUsername,
-                                    proxyPassword.toCharArray(),
-                                )
-                            }
-
-                            return null
-                        }
-                    },
+    if (!slimMode) {
+        // socks proxy settings
+        serverConfig.subscribeTo(
+            combine<Any, ProxySettings>(
+                serverConfig.socksProxyEnabled,
+                serverConfig.socksProxyVersion,
+                serverConfig.socksProxyHost,
+                serverConfig.socksProxyPort,
+                serverConfig.socksProxyUsername,
+                serverConfig.socksProxyPassword,
+            ) { vargs ->
+                ProxySettings(
+                    vargs[0] as Boolean,
+                    vargs[1] as Int,
+                    vargs[2] as String,
+                    vargs[3] as String,
+                    vargs[4] as String,
+                    vargs[5] as String,
                 )
-            } else {
-                System.clearProperty("socksProxyHost")
-                System.clearProperty("socksProxyPort")
-                System.clearProperty("socksProxyVersion")
+            }.distinctUntilChanged(),
+            { (proxyEnabled, proxyVersion, proxyHost, proxyPort, proxyUsername, proxyPassword) ->
+                logger.info {
+                    "Socks Proxy changed - enabled=$proxyEnabled address=$proxyHost:$proxyPort , username=[REDACTED], password=[REDACTED]"
+                }
+                if (proxyEnabled) {
+                    System.setProperty("socksProxyHost", proxyHost)
+                    System.setProperty("socksProxyPort", proxyPort)
+                    System.setProperty("socksProxyVersion", proxyVersion.toString())
 
-                Authenticator.setDefault(null)
-            }
-        },
-        ignoreInitialValue = false,
-    )
+                    Authenticator.setDefault(
+                        object : Authenticator() {
+                            override fun getPasswordAuthentication(): PasswordAuthentication? {
+                                if (requestingProtocol.startsWith("SOCKS", ignoreCase = true)) {
+                                    return PasswordAuthentication(
+                                        proxyUsername,
+                                        proxyPassword.toCharArray(),
+                                    )
+                                }
 
-    // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga
-    Security.addProvider(BouncyCastleProvider())
+                                return null
+                            }
+                        },
+                    )
+                } else {
+                    System.clearProperty("socksProxyHost")
+                    System.clearProperty("socksProxyPort")
+                    System.clearProperty("socksProxyVersion")
 
-    // start automated global updates
-    val updater = Injekt.get<IUpdater>()
-    (updater as Updater).scheduleUpdateTask()
-
-    // start automated backups
-    ProtoBackupExport.scheduleAutomatedBackupTask()
-
-    // start DownloadManager and restore + resume downloads
-    DownloadManager.restoreAndResumeDownloads()
-
-    SyncManager.scheduleSyncTask()
-
-    // asynchronously initialize CEF
-    GlobalScope.launch {
-        CEFManager.init()
+                    Authenticator.setDefault(null)
+                }
+            },
+            ignoreInitialValue = false,
+        )
     }
 
-    serverConfig.subscribeTo(
-        serverConfig.extensionStores,
-        { _ ->
-            ExtensionStoreService.syncPrefsToDb()
-        },
-        ignoreInitialValue = false,
-    )
+    // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga.
+    // Extensions need it. In GoManga slim-mode it is registered by the early
+    // background thread above so it does not block loopback listener startup.
+    if (!slimMode) {
+        Security.addProvider(BouncyCastleProvider())
+    }
+
+    if (!slimMode) {
+        // start automated global updates
+        val updater = Injekt.get<IUpdater>()
+        (updater as Updater).scheduleUpdateTask()
+
+        // start automated backups
+        ProtoBackupExport.scheduleAutomatedBackupTask()
+
+        // start DownloadManager and restore + resume downloads
+        DownloadManager.restoreAndResumeDownloads()
+
+        // v2.3 side-effect: schedule the sync task
+        SyncManager.scheduleSyncTask()
+
+        // asynchronously initialize CEF (native Chromium)
+        GlobalScope.launch {
+            CEFManager.init()
+        }
+
+        // v2.3 side-effect: keep extension-store prefs mirrored into the DB
+        serverConfig.subscribeTo(
+            serverConfig.extensionStores,
+            { _ ->
+                ExtensionStoreService.syncPrefsToDb()
+            },
+            ignoreInitialValue = false,
+        )
+    } else {
+        // [GoManga slim-mode] Skip every heavy desktop/server startup side-effect:
+        // SystemTray, SocksProxy, Updater, AutomatedBackups,
+        // DownloadManager.restoreAndResume, and v2.3's new SyncManager schedule +
+        // ExtensionStore prefs->db sync subscription.
+        //
+        // [KCEF/JCEF no-op] CEFManager.init() (native Chromium) is intentionally
+        // NOT called on the GoManga iOS runtime. In the on-Mac OpenJ9 -Xint boot
+        // test the native CefApp init crashed with a SIGSEGV that the onError
+        // handler does NOT catch, taking down the JVM ~14s AFTER Javalin was
+        // already listening. iOS has no native Chromium at all, so this eager init
+        // must never run on the embedded runtime. The no-op is expressed by
+        // skipping CEFManager.init() here rather than editing CEFManager.kt.
+        logger.info {
+            "GoManga slim-mode: skipping SystemTray, SocksProxy, Updater, AutomatedBackups, " +
+                "DownloadManager.restoreAndResume, SyncManager, ExtensionStore sync, and CEF init"
+        }
+    }
 }

@@ -37,6 +37,8 @@ import suwayomi.tachidesk.manga.model.table.SourceMetaTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import uy.kohesive.injekt.injectLazy
 import xyz.nulldev.androidcompat.androidimpl.CustomContext
+import xyz.nulldev.androidcompat.io.sharedprefs.JavaSharedPreferences
+import xyz.nulldev.androidcompat.io.sharedprefs.SourcePreferencePersistenceCapability
 
 object Source {
     private val logger = KotlinLogging.logger {}
@@ -130,9 +132,45 @@ object Source {
         val value: String,
     )
 
+    /** GOMANGA_SOURCE_PREFERENCE_TRANSACTION_V1 */
+    data class SourcePreferenceUpdateResult(
+        val status: String,
+        val code: String? = null,
+        val warning: String? = null,
+        val source: SourceDataClass? = null,
+    )
+
+    data class SourcePreferencePersistenceCapabilities(
+        val supportsMemoryOnlySourcePreferences: Boolean,
+        val requiresCanonicalCommit: Boolean,
+        val hasLegacySourcePreferences: Boolean,
+    )
+
+    data class SourcePreferenceCaptureToken(val token: String)
+
+    private suspend fun sourcePreferenceStore(sourceId: Long): JavaSharedPreferences? {
+        val screen = preferenceScreenMap[sourceId] ?: runCatching {
+            getSourcePreferencesRaw(sourceId)
+            preferenceScreenMap[sourceId]
+        }.getOrNull()
+        return screen?.sharedPreferences as? JavaSharedPreferences
+    }
+
+    suspend fun sourcePreferencePersistenceCapabilities(sourceId: Long): SourcePreferencePersistenceCapabilities {
+        // Non-configurable sources have no screen/store and remain usable.
+        val memoryOnly = SourcePreferencePersistenceCapability.memoryOnly("source_$sourceId")
+        return SourcePreferencePersistenceCapabilities(memoryOnly, true, sourcePreferenceStore(sourceId)?.hasLegacySourcePreferences() == true)
+    }
+
+    suspend fun registerSourcePreferenceCapture(sourceId: Long, token: String): Boolean =
+        sourcePreferenceStore(sourceId)?.registerCanonicalCapture(token) == true
+
+    suspend fun acknowledgeSourcePreferenceCapture(sourceId: Long, token: String): Boolean =
+        sourcePreferenceStore(sourceId)?.acknowledgeCanonicalCapture(token, committed = true) == true
+
     private val jsonMapper: JsonMapper by injectLazy()
 
-    fun setSourcePreference(
+    suspend fun setSourcePreference(
         sourceId: Long,
         position: Int,
         value: String,
@@ -144,21 +182,52 @@ object Source {
                 else -> throw RuntimeException("Unsupported type conversion")
             }
         },
-    ) {
-        val screen = preferenceScreenMap[sourceId]!!
-        val pref = screen.preferences[position]
+    ): SourcePreferenceUpdateResult {
+        val screen =
+            preferenceScreenMap[sourceId]
+                ?: return SourcePreferenceUpdateResult(
+                    status = "invalid",
+                    code = "preference_screen_unavailable",
+                )
+        val pref =
+            screen.preferences.getOrNull(position)
+                ?: return SourcePreferenceUpdateResult(
+                    status = "invalid",
+                    code = "invalid_preference_position",
+                )
 
         if (!pref.isEnabled) {
-            return
+            return SourcePreferenceUpdateResult(
+                status = "invalid",
+                code = "preference_disabled",
+            )
         }
 
-        val newValue = getValue(pref)
+        val newValue =
+            runCatching { getValue(pref) }
+                .getOrElse {
+                    return SourcePreferenceUpdateResult(
+                        status = "invalid",
+                        code = "invalid_preference_value",
+                    )
+                }
+
+        if (!pref.callChangeListener(newValue)) {
+            return SourcePreferenceUpdateResult(
+                status = "rejected",
+                code = "preference_change_rejected",
+            )
+        }
 
         pref.saveNewValue(newValue)
-        pref.callChangeListener(newValue)
-
-        // must reload the source because a preference was changed
         unregisterSource(sourceId)
+
+        val rebuiltSource = getSource(sourceId)
+        return SourcePreferenceUpdateResult(
+            status = "accepted",
+            warning = if (rebuiltSource == null) "source_rebuild_failed" else null,
+            source = rebuiltSource,
+        )
     }
 
     fun getSourcesMetaMaps(ids: List<Long>): Map<Long, Map<String, String>> =

@@ -34,6 +34,7 @@ import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import org.jetbrains.exposed.v1.jdbc.upsert
+import suwayomi.tachidesk.manga.impl.builtin.komga.BuiltInKomgaLifecycle
 import suwayomi.tachidesk.manga.impl.util.AndroidManifestParser
 import suwayomi.tachidesk.manga.impl.util.PackageTools
 import suwayomi.tachidesk.manga.impl.util.PackageTools.EXTENSION_FEATURE
@@ -102,6 +103,7 @@ object Extension {
         pkgName: String,
         isUpdate: Boolean = false,
     ): String {
+        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
         logger.debug { "Installing $pkgName" }
         val extension =
             transaction {
@@ -373,6 +375,10 @@ object Extension {
         val extPackage = fetchPackage()
         val metadata = extPackage.metadata
         val pkgName = metadata.packageName
+        if (BuiltInKomgaLifecycle.isBuiltInPackage(pkgName)) {
+            extPackage.file.deleteIfExists()
+            BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
+        }
 
         val extension =
             transaction {
@@ -676,7 +682,7 @@ object Extension {
         assetsFolder.deleteRecursively()
     }
 
-    private fun extractAndParseAndroidManifest(jar: Path): AndroidManifestParser.AndroidManifest =
+    internal fun extractAndParseAndroidManifest(jar: Path): AndroidManifestParser.AndroidManifest =
         ZipFile.builder().setPath(jar).get().use { jarZip ->
             jarZip.getInputStream(jarZip.getEntry("AndroidManifest.xml")).use {
                 AndroidManifestParser.parse(it)
@@ -734,6 +740,7 @@ object Extension {
     }
 
     fun uninstallExtension(pkgName: String) {
+        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
         logger.debug { "Uninstalling $pkgName" }
 
         transaction {
@@ -761,6 +768,7 @@ object Extension {
     }
 
     suspend fun updateExtension(pkgName: String): String {
+        BuiltInKomgaLifecycle.rejectExtensionMutation(pkgName)
         val targetExtension =
             checkNotNull(ExtensionsList.updateMap[pkgName]) {
                 "Extension update information for \"$pkgName\" missing. Refetch the extensions"
